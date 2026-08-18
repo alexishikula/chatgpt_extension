@@ -678,6 +678,9 @@ async function validateAgentResult(state, sourceAgentId, command) {
         downloadUrl: command.download_url
       });
     }
+    
+    // Mark task as requiring PM review for download
+    state.tasks[taskId].requiresPmReviewForDownload = true;
   }
   
   return null;
@@ -1396,6 +1399,90 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      // P0 Guard Rail: PM approves download for a task
+      case 'AUTOMATOR_APPROVE_DOWNLOAD': {
+        const { taskId, fileId, downloadUrl } = message;
+        
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        
+        const state = await mutateState(async (draft) => {
+          const task = draft.tasks[taskId];
+          if (!task) {
+            throw new Error(`Task not found: ${taskId}`);
+          }
+          
+          // Update task status to PM_APPROVED to allow downloads
+          task.status = 'PM_APPROVED';
+          task.pmApprovedDownloadAt = nowIso();
+          task.requiresPmReviewForDownload = false;
+          
+          logEvent(draft, 'DOWNLOAD_APPROVED_BY_PM', {
+            taskId,
+            fileId: fileId || null,
+            downloadUrl: downloadUrl || null
+          });
+        });
+        
+        // Trigger the download after approval
+        if (fileId) {
+          const fileData = await getFileData(fileId);
+          if (fileData) {
+            try {
+              await chrome.downloads.download({
+                url: fileData.dataUrl,
+                filename: fileData.fileName,
+                saveAs: false
+              });
+              
+              logEvent(await loadState(), 'FILE_DOWNLOADED_AFTER_PM_APPROVAL', {
+                fileId,
+                fileName: fileData.fileName,
+                taskId
+              });
+              
+              sendResponse({ ok: true, fileId, fileName: fileData.fileName, approved: true });
+              return;
+            } catch (downloadError) {
+              logEvent(await loadState(), 'FILE_DOWNLOAD_AFTER_APPROVAL_FAILED', {
+                fileId,
+                error: String(downloadError.message || downloadError)
+              });
+              throw downloadError;
+            }
+          } else {
+            throw new Error(`File not found: ${fileId}`);
+          }
+        } else if (downloadUrl) {
+          try {
+            await chrome.downloads.download({
+              url: downloadUrl,
+              saveAs: false
+            });
+            
+            logEvent(await loadState(), 'URL_DOWNLOADED_AFTER_PM_APPROVAL', {
+              taskId,
+              downloadUrl
+            });
+            
+            sendResponse({ ok: true, downloadUrl, approved: true });
+            return;
+          } catch (downloadError) {
+            logEvent(await loadState(), 'URL_DOWNLOAD_AFTER_APPROVAL_FAILED', {
+              taskId,
+              downloadUrl,
+              error: String(downloadError.message || downloadError)
+            });
+            throw downloadError;
+          }
+        } else {
+          // Just approve without downloading
+          sendResponse({ ok: true, approved: true, taskId });
+        }
+        return;
+      }
+
       case 'AUTOMATOR_RECONCILE_NOW':
         await reconcile();
         sendResponse({ ok: true, state: await loadState() });
@@ -1569,6 +1656,93 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         
         sendResponse({ ok: true, taskId, results });
+        return;
+      }
+
+      // P0 Guard Rail: Trigger download with PM approval enforcement
+      case 'AUTOMATOR_TRIGGER_DOWNLOAD': {
+        const { taskId, fileId, downloadUrl, pmApproved } = message;
+        
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        
+        // Enforce PM approval requirement
+        if (!pmApproved) {
+          const state = await loadState();
+          const task = state.tasks[taskId];
+          if (!task) {
+            throw new Error(`Task not found: ${taskId}`);
+          }
+          
+          // Check if task is in PM_REVIEW status
+          if (task.status !== 'PM_REVIEW' && task.status !== 'PM_APPROVED') {
+            throw new Error('Download requires PM approval. Task must be in PM_REVIEW or PM_APPROVED status.');
+          }
+          
+          // Check if download_url was flagged for PM review
+          if (task.requiresPmReviewForDownload) {
+            throw new Error('This download_url requires explicit PM approval before proceeding.');
+          }
+        }
+        
+        // If fileId provided, download from sidecar
+        if (fileId) {
+          const fileData = await getFileData(fileId);
+          if (!fileData) {
+            throw new Error(`File not found: ${fileId}`);
+          }
+          
+          try {
+            await chrome.downloads.download({
+              url: fileData.dataUrl,
+              filename: fileData.fileName,
+              saveAs: false
+            });
+            
+            logEvent(await loadState(), 'FILE_TRIGGER_DOWNLOADED', {
+              fileId,
+              fileName: fileData.fileName,
+              taskId,
+              pmApproved
+            });
+            
+            sendResponse({ ok: true, fileId, fileName: fileData.fileName, source: 'sidecar' });
+          } catch (downloadError) {
+            logEvent(await loadState(), 'FILE_TRIGGER_DOWNLOAD_FAILED', {
+              fileId,
+              error: String(downloadError.message || downloadError)
+            });
+            throw downloadError;
+          }
+        } 
+        // If downloadUrl provided, trigger direct download
+        else if (downloadUrl) {
+          try {
+            await chrome.downloads.download({
+              url: downloadUrl,
+              saveAs: false
+            });
+            
+            logEvent(await loadState(), 'URL_TRIGGER_DOWNLOADED', {
+              taskId,
+              downloadUrl,
+              pmApproved
+            });
+            
+            sendResponse({ ok: true, downloadUrl, source: 'url' });
+          } catch (downloadError) {
+            logEvent(await loadState(), 'URL_TRIGGER_DOWNLOAD_FAILED', {
+              taskId,
+              downloadUrl,
+              error: String(downloadError.message || downloadError)
+            });
+            throw downloadError;
+          }
+        } else {
+          throw new Error('Either fileId or downloadUrl must be provided');
+        }
+        
         return;
       }
 
