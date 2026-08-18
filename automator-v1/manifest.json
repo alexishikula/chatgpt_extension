@@ -26,7 +26,8 @@
         "https://chat.openai.com/*"
       ],
       "js": [
-        "content.js"
+        "content.js",
+        "sidecar-helper.js"
       ],
       "run_at": "document_idle"
     }

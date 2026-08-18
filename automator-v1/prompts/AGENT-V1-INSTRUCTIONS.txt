@@ -41,6 +41,64 @@ JSON SYNTAX REQUIREMENTS:
 - No trailing commas after the last item in objects or arrays
 - Use proper escaping for quotes inside strings: \"
 
+STORING FILE DELIVERABLES (ZIP files, binaries, large artifacts):
+When your task produces file deliverables (e.g., .zip, .apk, .tar.gz), use the browser's file sidecar API to store them before returning TASK_RESULT. This ensures the PM can access the actual files, not just metadata.
+
+To store a file, send a message to the automator background script:
+
+Example using JavaScript in the browser console or content script:
+```javascript
+// Convert file to Data URL (base64)
+const fileInput = document.querySelector('input[type="file"]');
+const file = fileInput.files[0];
+const reader = new FileReader();
+reader.onload = (e) => {
+  const dataUrl = e.target.result; // data:application/zip;base64,...
+  
+  // Store in sidecar
+  chrome.runtime.sendMessage(
+    {
+      type: 'AUTOMATOR_STORE_FILE',
+      taskId: 'YOUR-TASK-ID',
+      fileName: 'Northstar-Native-TV-Foundation.zip',
+      fileType: 'application/zip',
+      dataUrl: dataUrl,
+      metadata: {
+        uploadedByAgentId: 'your-agent-id',
+        sha256: 'abc123...',
+        description: 'Android TV foundation APK project'
+      }
+    },
+    (response) => {
+      if (response.ok) {
+        console.log('File stored:', response.fileId);
+      } else {
+        console.error('Storage failed:', response.error);
+      }
+    }
+  );
+};
+reader.readAsDataURL(file);
+```
+
+Then reference the stored file in your TASK_RESULT summary:
+<<AUTOMATOR>>
+{
+  "action": "TASK_RESULT",
+  "task_id": "NATIVE-APP-001",
+  "status": "COMPLETE",
+  "summary": "Completed Android TV foundation. Deliverable stored in sidecar: Northstar-Native-TV-Foundation.zip (SHA256: abc123...)"
+}
+<<END_AUTOMATOR>>
+
+The PM can retrieve stored files using:
+chrome.runtime.sendMessage({ type: 'AUTOMATOR_GET_FILES', taskId: 'NATIVE-APP-001' })
+
+STORAGE LIMITS:
+- Maximum file size: 5MB per file
+- Maximum total storage: 50MB across all tasks
+- Files persist until explicitly deleted or task is cleared
+
 Examples:
 
 Successful completion:
@@ -92,3 +150,4 @@ RULES
 - Your full prose response is relayed to PM. The JSON block is the machine-readable completion signal.
 - Normal prose may appear before the block, but only one AUTOMATOR block may appear in the final answer.
 - The automator has lenient parsing that can recover common mistakes, but you should always use correct format.
+- For file deliverables, store them in the sidecar BEFORE returning TASK_RESULT so the PM can access them.

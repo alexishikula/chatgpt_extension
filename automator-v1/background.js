@@ -1,4 +1,5 @@
 const STORAGE_KEY = 'automatorStateV1';
+const FILE_SIDECAR_KEY = 'automatorFileSidecarV1';
 const RECONCILE_ALARM = 'automator-reconcile';
 const CHATGPT_URL_RE = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//i;
 const ACTIVE_TASK_STATES = new Set(['DISPATCHING', 'RUNNING', 'RESPONSE_NO_VALID_RESULT']);
@@ -9,6 +10,8 @@ const AGENT_RESULT_STATUSES = new Set([
   'ESCALATION_REQUIRED',
   'OWNER_ACTION_REQUIRED'
 ]);
+const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB per file
+const MAX_TOTAL_STORAGE_BYTES = 50 * 1024 * 1024; // 50MB total
 
 let stateMutationQueue = Promise.resolve();
 
@@ -21,6 +24,7 @@ const DEFAULT_STATE = {
   eventLog: [],
   lastSeenByAgent: {},
   lastProcessedByAgent: {},
+  fileSidecar: {}, // Stores file metadata and blobs for task deliverables
   settings: {
     autoRoute: true,
     reconcilePeriodMinutes: 1
@@ -101,6 +105,123 @@ async function loadState() {
 async function saveState(state) {
   state.version = 2;
   await chrome.storage.local.set({ [STORAGE_KEY]: state });
+}
+
+// File Sidecar Functions for storing deliverables between agents
+async function loadFileSidecar() {
+  const stored = await chrome.storage.local.get(FILE_SIDECAR_KEY);
+  return stored[FILE_SIDECAR_KEY] || {};
+}
+
+async function saveFileSidecar(sidecar) {
+  await chrome.storage.local.set({ [FILE_SIDECAR_KEY]: sidecar });
+}
+
+async function getTotalStorageSize() {
+  const sidecar = await loadFileSidecar();
+  let totalBytes = 0;
+  for (const entry of Object.values(sidecar)) {
+    if (entry.data && typeof entry.data === 'string') {
+      totalBytes += entry.data.length * 2; // UTF-16 encoding
+    }
+  }
+  return totalBytes;
+}
+
+async function storeFileForTask(taskId, fileName, fileType, dataUrl, metadata = {}) {
+  return await mutateState(async (state) => {
+    const sidecar = await loadFileSidecar();
+    
+    // Check storage limits
+    const currentSize = await getTotalStorageSize();
+    const newDataSize = dataUrl.length * 2;
+    if (currentSize + newDataSize > MAX_TOTAL_STORAGE_BYTES) {
+      throw new Error(`Storage limit exceeded. Current: ${(currentSize / 1024 / 1024).toFixed(2)}MB, Max: ${(MAX_TOTAL_STORAGE_BYTES / 1024 / 1024)}MB`);
+    }
+    
+    if (newDataSize > MAX_FILE_SIZE_BYTES) {
+      throw new Error(`File too large: ${(newDataSize / 1024 / 1024).toFixed(2)}MB exceeds ${(MAX_FILE_SIZE_BYTES / 1024 / 1024)}MB limit`);
+    }
+    
+    const fileId = `${taskId}:${fileName}`;
+    sidecar[fileId] = {
+      taskId,
+      fileName,
+      fileType,
+      dataUrl,
+      sizeBytes: newDataSize,
+      uploadedAt: nowIso(),
+      uploadedByAgentId: metadata.uploadedByAgentId || null,
+      sha256: metadata.sha256 || null,
+      description: metadata.description || ''
+    };
+    
+    await saveFileSidecar(sidecar);
+    state.fileSidecar = sidecar;
+    
+    logEvent(state, 'FILE_STORED_IN_SIDECAR', {
+      fileId,
+      taskId,
+      fileName,
+      sizeBytes: newDataSize
+    });
+    
+    return { fileId, sizeBytes: newDataSize };
+  });
+}
+
+async function getFilesForTask(taskId) {
+  const sidecar = await loadFileSidecar();
+  const files = [];
+  for (const [fileId, entry] of Object.entries(sidecar)) {
+    if (entry.taskId === taskId) {
+      files.push({
+        fileId,
+        fileName: entry.fileName,
+        fileType: entry.fileType,
+        sizeBytes: entry.sizeBytes,
+        uploadedAt: entry.uploadedAt,
+        sha256: entry.sha256,
+        description: entry.description
+      });
+    }
+  }
+  return files;
+}
+
+async function getFileData(fileId) {
+  const sidecar = await loadFileSidecar();
+  return sidecar[fileId] || null;
+}
+
+async function deleteFileFromSidecar(fileId) {
+  return await mutateState(async (state) => {
+    const sidecar = await loadFileSidecar();
+    if (sidecar[fileId]) {
+      delete sidecar[fileId];
+      await saveFileSidecar(sidecar);
+      state.fileSidecar = sidecar;
+      logEvent(state, 'FILE_DELETED_FROM_SIDECAR', { fileId });
+    }
+  });
+}
+
+async function clearTaskFiles(taskId) {
+  return await mutateState(async (state) => {
+    const sidecar = await loadFileSidecar();
+    let deletedCount = 0;
+    for (const [fileId, entry] of Object.entries(sidecar)) {
+      if (entry.taskId === taskId) {
+        delete sidecar[fileId];
+        deletedCount++;
+      }
+    }
+    if (deletedCount > 0) {
+      await saveFileSidecar(sidecar);
+      state.fileSidecar = sidecar;
+      logEvent(state, 'TASK_FILES_CLEARED', { taskId, deletedCount });
+    }
+  });
 }
 
 function logEvent(state, type, details = {}) {
@@ -1144,6 +1265,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await saveState(structuredClone(DEFAULT_STATE));
         sendResponse({ ok: true, state: await loadState() });
         return;
+
+      // File Sidecar API for storing deliverables between agents
+      case 'AUTOMATOR_STORE_FILE': {
+        const { taskId, fileName, fileType, dataUrl, metadata } = message;
+        if (!taskId || !fileName || !dataUrl) {
+          throw new Error('taskId, fileName, and dataUrl are required');
+        }
+        try {
+          const result = await storeFileForTask(taskId, fileName, fileType || 'application/octet-stream', dataUrl, metadata);
+          sendResponse({ ok: true, ...result });
+        } catch (error) {
+          sendResponse({ ok: false, error: error.message });
+        }
+        return;
+      }
+
+      case 'AUTOMATOR_GET_FILES': {
+        const { taskId } = message;
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        const files = await getFilesForTask(taskId);
+        sendResponse({ ok: true, files });
+        return;
+      }
+
+      case 'AUTOMATOR_GET_FILE_DATA': {
+        const { fileId } = message;
+        if (!fileId) {
+          throw new Error('fileId is required');
+        }
+        const fileData = await getFileData(fileId);
+        sendResponse({ ok: true, file: fileData });
+        return;
+      }
+
+      case 'AUTOMATOR_DELETE_FILE': {
+        const { fileId } = message;
+        if (!fileId) {
+          throw new Error('fileId is required');
+        }
+        await deleteFileFromSidecar(fileId);
+        sendResponse({ ok: true });
+        return;
+      }
+
+      case 'AUTOMATOR_CLEAR_TASK_FILES': {
+        const { taskId } = message;
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        await clearTaskFiles(taskId);
+        sendResponse({ ok: true });
+        return;
+      }
+
+      case 'AUTOMATOR_GET_STORAGE_INFO': {
+        const totalSize = await getTotalStorageSize();
+        sendResponse({
+          ok: true,
+          usedBytes: totalSize,
+          usedMB: (totalSize / 1024 / 1024).toFixed(2),
+          maxBytes: MAX_TOTAL_STORAGE_BYTES,
+          maxMB: (MAX_TOTAL_STORAGE_BYTES / 1024 / 1024).toFixed(2),
+          percentUsed: ((totalSize / MAX_TOTAL_STORAGE_BYTES) * 100).toFixed(1)
+        });
+        return;
+      }
 
       default:
         sendResponse({ ok: false, error: 'Unknown message type' });
