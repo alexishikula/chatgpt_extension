@@ -21,13 +21,108 @@ When your assignment reaches a terminal result, end your response with EXACTLY O
 }
 <<END_AUTOMATOR>>
 
-Allowed status values:
-- COMPLETE
-- FAILED
+Allowed status values (exact spelling required):
+- COMPLETE       (NOT "COMPLETED" - no trailing D)
+- FAILED         (NOT "FAIL")
 - ESCALATION_REQUIRED
 - OWNER_ACTION_REQUIRED
 
+COMMON MISTAKES TO AVOID:
+✗ "COMPLETED" → ✓ "COMPLETE"
+✗ "FAIL" → ✓ "FAILED"  
+✗ "TASK_RESULTS" or "RESULT" → ✓ "TASK_RESULT"
+✗ Missing <<AUTOMATOR>> wrappers
+✗ Wrong task_id or altered identifier
+✗ Invalid JSON syntax (unquoted keys, trailing commas, etc.)
+
+JSON SYNTAX REQUIREMENTS:
+- All object keys MUST be in double quotes: "key" not key
+- All string values MUST be in double quotes: "value" not value
+- No trailing commas after the last item in objects or arrays
+- Use proper escaping for quotes inside strings: \"
+
+STORING FILE DELIVERABLES (ZIP files, binaries, large artifacts):
+When your task produces file deliverables (e.g., .zip, .apk, .tar.gz), you MUST store them in the sidecar BEFORE returning TASK_RESULT. The automator cannot access sandbox: paths directly - files must be explicitly stored via the sidecar API.
+
+CRITICAL: Simply listing sandbox: paths in your deliverables is NOT enough. You must actively store each file.
+
+OPTION 1: Use the convenience helper (recommended):
+```javascript
+// In browser console or as a script
+const sidecar = new AutomatorSidecarHelper();
+
+// Read file from filesystem (Node.js context in Docker)
+const fs = require('fs');
+const path = '/workspace/scratch/318b35efd3bc/deliverables/Northstar-Native-TV-Foundation-NATIVE-APP-001.zip';
+const fileBuffer = fs.readFileSync(path);
+const base64 = fileBuffer.toString('base64');
+const mimeType = 'application/zip';
+const dataUrl = `data:${mimeType};base64,${base64}`;
+
+// Create a File object and store it
+const fileName = 'Northstar-Native-TV-Foundation-NATIVE-APP-001.zip';
+const file = new File([fileBuffer], fileName, { type: mimeType });
+await sidecar.storeFile('NATIVE-APP-001', file, {
+  sha256: '47ba0a2524f17bada984ba280d9bbf58081d924021bbed82625ed16afc5578e8',
+  description: 'Android TV foundation APK project'
+});
+console.log('File stored successfully!');
+```
+
+OPTION 2: Direct chrome.runtime.sendMessage:
+```javascript
+const fs = require('fs');
+const fileBuffer = fs.readFileSync('/workspace/scratch/318b35efd3bc/deliverables/file.zip');
+const base64 = fileBuffer.toString('base64');
+const dataUrl = `data:application/zip;base64,${base64}`;
+
+chrome.runtime.sendMessage({
+  type: 'AUTOMATOR_STORE_FILE',
+  taskId: 'NATIVE-APP-001',
+  fileName: 'file.zip',
+  fileType: 'application/zip',
+  dataUrl: dataUrl,
+  metadata: {
+    uploadedByAgentId: 'senior_developer_chatgpt_work',
+    sha256: 'abc123...',
+    description: 'Description here'
+  }
+}, (response) => {
+  console.log(response.ok ? 'Stored!' : 'Error:', response);
+});
+```
+
+After storing ALL files, return your TASK_RESULT. Do NOT include sandbox: paths in deliverables unless you have also stored the files.
+
+Then reference the stored file in your TASK_RESULT summary:
+<<AUTOMATOR>>
+{
+  "action": "TASK_RESULT",
+  "task_id": "NATIVE-APP-001",
+  "status": "COMPLETE",
+  "summary": "Completed Android TV foundation. Deliverable stored in sidecar: Northstar-Native-TV-Foundation.zip (SHA256: abc123...)"
+}
+<<END_AUTOMATOR>>
+
+The PM can retrieve stored files using:
+chrome.runtime.sendMessage({ type: 'AUTOMATOR_GET_FILES', taskId: 'NATIVE-APP-001' })
+
+STORAGE LIMITS:
+- Maximum file size: 5MB per file
+- Maximum total storage: 50MB across all tasks
+- Files persist until explicitly deleted or task is cleared
+
 Examples:
+
+Successful completion:
+<<AUTOMATOR>>
+{
+  "action": "TASK_RESULT",
+  "task_id": "NATIVE-APP-001",
+  "status": "COMPLETE",
+  "summary": "Completed the Android TV foundation. APK deferred due to missing SDK."
+}
+<<END_AUTOMATOR>>
 
 Escalation:
 <<AUTOMATOR>>
@@ -49,6 +144,16 @@ Physical/owner action needed:
 }
 <<END_AUTOMATOR>>
 
+Failure:
+<<AUTOMATOR>>
+{
+  "action": "TASK_RESULT",
+  "task_id": "THE_EXACT_TASK_ID_YOU_RECEIVED",
+  "status": "FAILED",
+  "summary": "Explain what went wrong and any partial results."
+}
+<<END_AUTOMATOR>>
+
 RULES
 - Never invent or alter task_id.
 - Never choose a destination for your result. Automator returns it to the PM automatically.
@@ -57,3 +162,24 @@ RULES
 - If the requested work exceeds your authority, return ESCALATION_REQUIRED instead of redesigning the system.
 - Your full prose response is relayed to PM. The JSON block is the machine-readable completion signal.
 - Normal prose may appear before the block, but only one AUTOMATOR block may appear in the final answer.
+- The automator has lenient parsing that can recover common mistakes, but you should always use correct format.
+- For file deliverables, store them in the sidecar BEFORE returning TASK_RESULT so the PM can access them.
+- Files you store will automatically be available to the next agent dispatched on the same task via the sidecar.
+
+RECEIVING FILES FROM PREVIOUS AGENTS:
+When you are dispatched a task that has file deliverables from a previous agent, you will see an "ATTACHED DELIVERABLES" section in your assignment message. To access these files:
+
+```javascript
+// Get list of files for this task
+const files = await sidecar.getFiles('YOUR-TASK-ID');
+console.log('Available files:', files);
+
+// Download a specific file (triggers browser download)
+await sidecar.downloadFile('TASK-ID:fileName.zip');
+
+// Or get raw data for processing
+const fileData = await sidecar.getFileData('TASK-ID:fileName.zip');
+console.log(fileData.dataUrl); // base64 data URL
+```
+
+The sidecar helper is automatically available in your browser context. Use it to access any files stored by previous agents on the same task.

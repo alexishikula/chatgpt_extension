@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Automator V1",
-  "version": "0.2.0",
-  "description": "Local PM-to-agent workflow orchestrator for explicitly assigned ChatGPT conversations.",
+  "version": "1.2.0",
+  "description": "Local PM-to-agent workflow orchestrator with automatic file transfer and intention extraction.",
   "minimum_chrome_version": "120",
   "permissions": [
     "storage",
@@ -26,7 +26,8 @@
         "https://chat.openai.com/*"
       ],
       "js": [
-        "content.js"
+        "content.js",
+        "sidecar-helper.js"
       ],
       "run_at": "document_idle"
     }

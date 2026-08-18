@@ -149,6 +149,62 @@
     characterData: true
   });
 
+  // Helper function to convert Blob to Data URL
+  async function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  // Handle file reading requests from background script
+  async function handleReadFileRequest(filePath, fileName, taskId, sha256) {
+    try {
+      // In a browser extension context, we cannot directly access sandbox: paths
+      // These paths refer to files inside the Docker container where the agent runs
+      // The agent must explicitly provide file content via sidecar.storeFile() before completing
+      
+      // Instead, we check if the agent has already stored this file via the sidecar API
+      // If not, we return an error indicating the file needs to be stored first
+      const storeFileMessage = {
+        type: 'AUTOMATOR_CHECK_STORED_FILE',
+        taskId,
+        fileName,
+        filePath,
+        sha256
+      };
+      
+      // Try to get the file from sidecar storage
+      const response = await chrome.runtime.sendMessage({
+        type: 'AUTOMATOR_GET_FILE_DATA',
+        fileId: `${taskId}:${fileName}`
+      });
+      
+      if (response && response.ok && response.file) {
+        return {
+          ok: true,
+          dataUrl: response.file.dataUrl,
+          fileName,
+          taskId,
+          source: 'sidecar'
+        };
+      }
+      
+      // File not found in sidecar - agent should have stored it before completing
+      throw new Error(`File not found in sidecar. Agent must call sidecar.storeFile() before completing task.`);
+      
+    } catch (error) {
+      return {
+        ok: false,
+        error: error.message,
+        fileName,
+        taskId
+      };
+    }
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
       if (message?.type === 'AUTOMATOR_GET_LAST_ASSISTANT') {
@@ -168,6 +224,12 @@
           hasComposer: Boolean(findComposer()),
           lastAssistant: getLastAssistantMessage()
         });
+        return;
+      }
+      if (message?.type === 'AUTOMATOR_READ_FILE') {
+        const { filePath, fileName, taskId, sha256 } = message;
+        const result = await handleReadFileRequest(filePath, fileName, taskId, sha256);
+        sendResponse(result);
         return;
       }
       sendResponse({ ok: false, error: 'Unknown content-script message' });

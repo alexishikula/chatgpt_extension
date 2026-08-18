@@ -1,4 +1,5 @@
 const STORAGE_KEY = 'automatorStateV1';
+const FILE_SIDECAR_KEY = 'automatorFileSidecarV1';
 const RECONCILE_ALARM = 'automator-reconcile';
 const CHATGPT_URL_RE = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//i;
 const ACTIVE_TASK_STATES = new Set(['DISPATCHING', 'RUNNING', 'RESPONSE_NO_VALID_RESULT']);
@@ -9,6 +10,8 @@ const AGENT_RESULT_STATUSES = new Set([
   'ESCALATION_REQUIRED',
   'OWNER_ACTION_REQUIRED'
 ]);
+const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB per file
+const MAX_TOTAL_STORAGE_BYTES = 50 * 1024 * 1024; // 50MB total
 
 let stateMutationQueue = Promise.resolve();
 
@@ -21,6 +24,7 @@ const DEFAULT_STATE = {
   eventLog: [],
   lastSeenByAgent: {},
   lastProcessedByAgent: {},
+  fileSidecar: {}, // Stores file metadata and blobs for task deliverables
   settings: {
     autoRoute: true,
     reconcilePeriodMinutes: 1
@@ -103,6 +107,123 @@ async function saveState(state) {
   await chrome.storage.local.set({ [STORAGE_KEY]: state });
 }
 
+// File Sidecar Functions for storing deliverables between agents
+async function loadFileSidecar() {
+  const stored = await chrome.storage.local.get(FILE_SIDECAR_KEY);
+  return stored[FILE_SIDECAR_KEY] || {};
+}
+
+async function saveFileSidecar(sidecar) {
+  await chrome.storage.local.set({ [FILE_SIDECAR_KEY]: sidecar });
+}
+
+async function getTotalStorageSize() {
+  const sidecar = await loadFileSidecar();
+  let totalBytes = 0;
+  for (const entry of Object.values(sidecar)) {
+    if (entry.data && typeof entry.data === 'string') {
+      totalBytes += entry.data.length * 2; // UTF-16 encoding
+    }
+  }
+  return totalBytes;
+}
+
+async function storeFileForTask(taskId, fileName, fileType, dataUrl, metadata = {}) {
+  return await mutateState(async (state) => {
+    const sidecar = await loadFileSidecar();
+    
+    // Check storage limits
+    const currentSize = await getTotalStorageSize();
+    const newDataSize = dataUrl.length * 2;
+    if (currentSize + newDataSize > MAX_TOTAL_STORAGE_BYTES) {
+      throw new Error(`Storage limit exceeded. Current: ${(currentSize / 1024 / 1024).toFixed(2)}MB, Max: ${(MAX_TOTAL_STORAGE_BYTES / 1024 / 1024)}MB`);
+    }
+    
+    if (newDataSize > MAX_FILE_SIZE_BYTES) {
+      throw new Error(`File too large: ${(newDataSize / 1024 / 1024).toFixed(2)}MB exceeds ${(MAX_FILE_SIZE_BYTES / 1024 / 1024)}MB limit`);
+    }
+    
+    const fileId = `${taskId}:${fileName}`;
+    sidecar[fileId] = {
+      taskId,
+      fileName,
+      fileType,
+      dataUrl,
+      sizeBytes: newDataSize,
+      uploadedAt: nowIso(),
+      uploadedByAgentId: metadata.uploadedByAgentId || null,
+      sha256: metadata.sha256 || null,
+      description: metadata.description || ''
+    };
+    
+    await saveFileSidecar(sidecar);
+    state.fileSidecar = sidecar;
+    
+    logEvent(state, 'FILE_STORED_IN_SIDECAR', {
+      fileId,
+      taskId,
+      fileName,
+      sizeBytes: newDataSize
+    });
+    
+    return { fileId, sizeBytes: newDataSize };
+  });
+}
+
+async function getFilesForTask(taskId) {
+  const sidecar = await loadFileSidecar();
+  const files = [];
+  for (const [fileId, entry] of Object.entries(sidecar)) {
+    if (entry.taskId === taskId) {
+      files.push({
+        fileId,
+        fileName: entry.fileName,
+        fileType: entry.fileType,
+        sizeBytes: entry.sizeBytes,
+        uploadedAt: entry.uploadedAt,
+        sha256: entry.sha256,
+        description: entry.description
+      });
+    }
+  }
+  return files;
+}
+
+async function getFileData(fileId) {
+  const sidecar = await loadFileSidecar();
+  return sidecar[fileId] || null;
+}
+
+async function deleteFileFromSidecar(fileId) {
+  return await mutateState(async (state) => {
+    const sidecar = await loadFileSidecar();
+    if (sidecar[fileId]) {
+      delete sidecar[fileId];
+      await saveFileSidecar(sidecar);
+      state.fileSidecar = sidecar;
+      logEvent(state, 'FILE_DELETED_FROM_SIDECAR', { fileId });
+    }
+  });
+}
+
+async function clearTaskFiles(taskId) {
+  return await mutateState(async (state) => {
+    const sidecar = await loadFileSidecar();
+    let deletedCount = 0;
+    for (const [fileId, entry] of Object.entries(sidecar)) {
+      if (entry.taskId === taskId) {
+        delete sidecar[fileId];
+        deletedCount++;
+      }
+    }
+    if (deletedCount > 0) {
+      await saveFileSidecar(sidecar);
+      state.fileSidecar = sidecar;
+      logEvent(state, 'TASK_FILES_CLEARED', { taskId, deletedCount });
+    }
+  });
+}
+
 function logEvent(state, type, details = {}) {
   state.eventLog.unshift({
     id: crypto.randomUUID(),
@@ -171,8 +292,62 @@ function parseProtocol(text) {
     const match = text.match(pattern);
     if (!match) continue;
     try {
-      return { found: true, command: JSON.parse(match[1]), error: null, raw: match[1] };
+      const parsed = JSON.parse(match[1]);
+      // Check if status needs correction even if JSON is valid
+      let corrected = normalizeStatusInCommand(parsed);
+      if (corrected) {
+        return {
+          found: true,
+          command: corrected.command,
+          error: corrected.error,
+          raw: match[1],
+          extracted: true
+        };
+      }
+      // Check if action needs correction
+      corrected = normalizeActionInCommand(parsed);
+      if (corrected) {
+        return {
+          found: true,
+          command: corrected.command,
+          error: corrected.error,
+          raw: match[1],
+          extracted: true
+        };
+      }
+      return { found: true, command: parsed, error: null, raw: match[1] };
     } catch (error) {
+      // Try to fix malformed JSON and re-parse
+      const fixed = fixMalformedJsonAndExtract(match[1]);
+      if (fixed) {
+        let corrected = normalizeStatusInCommand(fixed.parsed);
+        if (corrected) {
+          return {
+            found: true,
+            command: corrected.command,
+            error: `Fixed JSON syntax and status: ${corrected.error}`,
+            raw: fixed.raw,
+            extracted: true
+          };
+        }
+        corrected = normalizeActionInCommand(fixed.parsed);
+        if (corrected) {
+          return {
+            found: true,
+            command: corrected.command,
+            error: `Fixed JSON syntax and action: ${corrected.error}`,
+            raw: fixed.raw,
+            extracted: true
+          };
+        }
+        return {
+          found: true,
+          command: fixed.parsed,
+          error: 'Fixed JSON syntax errors',
+          raw: fixed.raw,
+          extracted: true
+        };
+      }
       return {
         found: true,
         command: null,
@@ -181,7 +356,233 @@ function parseProtocol(text) {
       };
     }
   }
+  
+  // Lenient fallback: attempt to extract intention from malformed output
+  const extracted = extractIntentionFromText(text);
+  if (extracted) {
+    return {
+      found: true,
+      command: extracted.command,
+      error: extracted.error,
+      raw: extracted.raw,
+      extracted: true
+    };
+  }
+  
   return { found: false, command: null, error: null };
+}
+
+/**
+ * Normalize common status typos in already-parsed commands.
+ * Returns corrected command if status was normalized, null otherwise.
+ */
+function normalizeStatusInCommand(command) {
+  if (!command || typeof command !== 'object') return null;
+  
+  const statusMap = {
+    'COMPLETED': 'COMPLETE',
+    'COMPLETE_TASK': 'COMPLETE',
+    'FAIL': 'FAILED',
+    'FAILURE': 'FAILED',
+    'ESCALATE': 'ESCALATION_REQUIRED',
+    'ESCALATION': 'ESCALATION_REQUIRED',
+    'OWNER_ACTION': 'OWNER_ACTION_REQUIRED',
+    'OWNER_APPROVAL': 'OWNER_ACTION_REQUIRED'
+  };
+  
+  const originalStatus = String(command.status || '');
+  const normalized = statusMap[originalStatus];
+  
+  if (normalized) {
+    return {
+      command: { ...command, status: normalized },
+      error: `Status value corrected: "${originalStatus}" → "${normalized}"`
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Normalize common action typos in already-parsed commands.
+ * Returns corrected command if action was normalized, null otherwise.
+ */
+function normalizeActionInCommand(command) {
+  if (!command || typeof command !== 'object') return null;
+  
+  const actionMap = {
+    'TASK_RESULTS': 'TASK_RESULT',
+    'RESULT': 'TASK_RESULT',
+    'DISPATCH': 'DISPATCH_TASK',
+    'DISPATCH_ASSIGNMENT': 'DISPATCH_TASK',
+    'REQUEST_APPROVAL': 'REQUEST_OWNER_APPROVAL',
+    'REQUEST_ACTION': 'REQUEST_OWNER_ACTION',
+    'CANCEL': 'CANCEL_TASK',
+    'COMPLETE': 'COMPLETE_TASK',
+    'PAUSE': 'PAUSE_PROJECT',
+    'FINISH_PROJECT': 'COMPLETE_PROJECT'
+  };
+  
+  const originalAction = String(command.action || '');
+  const normalized = actionMap[originalAction];
+  
+  if (normalized) {
+    return {
+      command: { ...command, action: normalized },
+      error: `Action value corrected: "${originalAction}" → "${normalized}"`
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Attempt to fix common JSON structure issues and extract fields.
+ */
+function fixMalformedJsonAndExtract(text) {
+  if (!text || typeof text !== 'string') return null;
+  
+  // Try to find and extract JSON object even without proper wrappers
+  const jsonPatterns = [
+    /\{[\s\S]*"action"[\s\S]*\}/,
+    /\{[\s\S]*"task_id"[\s\S]*\}/,
+    /\{[\s\S]*"status"[\s\S]*\}/
+  ];
+  
+  for (const pattern of jsonPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      let jsonStr = match[0];
+      
+      // Fix common JSON syntax errors
+      // Missing quotes around keys
+      jsonStr = jsonStr.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
+      
+      // Trailing commas
+      jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1');
+      
+      // Unquoted string values (basic cases)
+      jsonStr = jsonStr.replace(/:\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*([,}\n])/g, ': "$1"$2');
+      
+      try {
+        const parsed = JSON.parse(jsonStr);
+        return { parsed, raw: jsonStr };
+      } catch (_) {
+        continue;
+      }
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Attempt to extract task result intention from unstructured or malformed text.
+ * This allows the automator to recover common mistakes like:
+ * - Missing protocol wrappers
+ * - Typos in status values (e.g., "COMPLETED" vs "COMPLETE")
+ * - Partial JSON structures
+ */
+function extractIntentionFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  
+  // Look for task_id patterns
+  const taskIdMatch = text.match(/task_id["\s:=]+([A-Z0-9_-]+)/i) ||
+                      text.match(/TASK_ID[:\s]+([A-Z0-9_-]+)/i);
+  const taskId = taskIdMatch ? taskIdMatch[1].trim() : null;
+  
+  // Look for status patterns with fuzzy matching
+  const statusCandidates = [
+    { pattern: /status["\\s:=]+\\s*"(COMPLETE|COMPLETED)"?/i, normalize: 'COMPLETE' },
+    { pattern: /status["\\s:=]+\\s*"(FAILED|FAIL)"?/i, normalize: 'FAILED' },
+    { pattern: /status["\\s:=]+\\s*"(ESCALATION_REQUIRED|ESCALATE)"?/i, normalize: 'ESCALATION_REQUIRED' },
+    { pattern: /status["\\s:=]+\\s*"(OWNER_ACTION_REQUIRED|OWNER_ACTION)"?/i, normalize: 'OWNER_ACTION_REQUIRED' }
+  ];
+  
+  let status = null;
+  for (const candidate of statusCandidates) {
+    const match = text.match(candidate.pattern);
+    if (match) {
+      status = candidate.normalize;
+      break;
+    }
+  }
+  
+  // Look for action patterns
+  const actionCandidates = [
+    { pattern: /action["\\s:=]+\\s*"?TASK_RESULT["\\s]?/i, normalize: 'TASK_RESULT' },
+    { pattern: /action["\\s:=]+\\s*"?DISPATCH_TASK["\\s]?/i, normalize: 'DISPATCH_TASK' },
+    { pattern: /action["\\s:=]+\\s*"?REQUEST_OWNER_APPROVAL["\\s]?/i, normalize: 'REQUEST_OWNER_APPROVAL' },
+    { pattern: /action["\\s:=]+\\s*"?REQUEST_OWNER_ACTION["\\s]?/i, normalize: 'REQUEST_OWNER_ACTION' }
+  ];
+  
+  let action = null;
+  for (const candidate of actionCandidates) {
+    const match = text.match(candidate.pattern);
+    if (match) {
+      action = candidate.normalize;
+      break;
+    }
+  }
+  
+  // Look for summary or description
+  const summaryMatch = text.match(/summary["\\s:=]+\\s*"([^"]+)"/i) ||
+                       text.match(/description["\\s:=]+\\s*"([^"]+)"/i);
+  const summary = summaryMatch ? summaryMatch[1].trim() : null;
+  
+  // Extract deliverables if present
+  let deliverables = null;
+  const deliverablesMatch = text.match(/deliverables["\\s:=]+\\s*(\\[.*?\\]|\\{.*?\\})/is);
+  if (deliverablesMatch) {
+    try {
+      deliverables = JSON.parse(deliverablesMatch[1]);
+    } catch (_) {}
+  }
+  
+  // Extract validation if present
+  let validation = null;
+  const validationMatch = text.match(/validation["\\s:=]+\\s*(\\{[^}]*\\})/is);
+  if (validationMatch) {
+    try {
+      validation = JSON.parse(validationMatch[1]);
+    } catch (_) {}
+  }
+  
+  // For TASK_RESULT actions, we need at least task_id and status
+  if (taskId && status) {
+    const extractedCommand = {
+      action: 'TASK_RESULT',
+      task_id: taskId,
+      status: status,
+      summary: summary || ''
+    };
+    
+    if (deliverables) extractedCommand.deliverables = deliverables;
+    if (validation) extractedCommand.validation = validation;
+    
+    return {
+      command: extractedCommand,
+      error: 'Extracted from unstructured text (missing protocol wrapper or typos corrected)',
+      raw: text.substring(0, 500) + (text.length > 500 ? '...' : '')
+    };
+  }
+  
+  // For PM actions, we need task_id and action
+  if (taskId && action && action !== 'TASK_RESULT') {
+    const extractedCommand = {
+      action: action,
+      task_id: taskId,
+      summary: summary || ''
+    };
+    
+    return {
+      command: extractedCommand,
+      error: 'Extracted PM action from unstructured text',
+      raw: text.substring(0, 500) + (text.length > 500 ? '...' : '')
+    };
+  }
+  
+  return null;
 }
 
 function validatePmCommand(state, command) {
@@ -294,44 +695,88 @@ async function resolveTabForAgent(state, agentId) {
 async function dispatchMessageToAgent(state, agentId, text, taskId = null) {
   const targetId = normalizeAgentId(agentId);
   const tab = await resolveTabForAgent(state, targetId);
+  
+  // If there are files in the sidecar for this task, include file metadata in the message
+  let enrichedText = text;
+  if (taskId) {
+    const files = await getFilesForTask(taskId);
+    if (files && files.length > 0) {
+      const fileList = files.map(f => `- ${f.fileName} (${f.fileType}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`).join('\n');
+      enrichedText = text + '\n\n---\nATTACHED DELIVERABLES FROM PREVIOUS AGENT:\n' + fileList + 
+                     '\n\nUse sidecar.getFileData(fileId) to retrieve each file.';
+    }
+  }
+  
   const response = await sendToTab(tab.id, {
     type: 'AUTOMATOR_SEND_MESSAGE',
-    text,
+    text: enrichedText,
     taskId
+  });
+  logEvent(state, 'DISPATCH_MESSAGE_TO_AGENT', { 
+    targetAgentId: targetId, 
+    tabId: tab.id, 
+    chars: text.length,
+    hasFiles: taskId ? (await getFilesForTask(taskId)).length > 0 : false
   });
   if (!response?.ok) throw new Error(response?.error || `Could not send to ${targetId}`);
   return response;
 }
 
-function buildAgentAssignment(task, targetAgent) {
+function buildAgentAssignment(task, targetAgent, attachedFiles = []) {
   const assignmentText = typeof task.assignment === 'string'
     ? task.assignment
     : JSON.stringify(task.assignment, null, 2);
+  
+  const hasFiles = attachedFiles && attachedFiles.length > 0;
+  const fileSection = hasFiles
+    ? [
+        '',
+        'ATTACHED FILES FROM PREVIOUS AGENTS:',
+        ...attachedFiles.map(f => `- ${f.fileName} (fileId: ${f.fileId}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`),
+        '',
+        'Use sidecar.getFileData(fileId) to retrieve each file.'
+      ].join('\n')
+    : '';
 
   return [
     'AUTOMATOR ASSIGNMENT',
     `TASK_ID: ${task.id}`,
     `FROM: ${task.createdByAgentId}`,
     `YOUR_AGENT_ID: ${targetAgent.id}`,
+    hasFiles ? `ATTACHED_FILE_COUNT: ${attachedFiles.length}` : '',
+    ...fileSection ? [fileSection] : [],
     '',
     'ASSIGNMENT:',
     assignmentText,
     '',
     'When this assignment is finished, return exactly one <<AUTOMATOR>> JSON block using action TASK_RESULT and this same TASK_ID.'
-  ].join('\n');
+  ].filter(line => line !== '').join('\n');
 }
 
-function buildPmResultEnvelope(sourceAgent, task, command, rawText) {
+function buildPmResultEnvelope(sourceAgent, task, command, rawText, files = []) {
+  const hasFiles = files && files.length > 0;
+  const fileSection = hasFiles 
+    ? [
+        '',
+        'ATTACHED DELIVERABLES:',
+        ...files.map(f => `- ${f.fileName} (${f.fileType}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`),
+        '',
+        'Use sidecar.getFileData(fileId) to retrieve each file.'
+      ].join('\n')
+    : '';
+  
   return [
     'AUTOMATOR AGENT RETURN',
     `SOURCE_AGENT_ID: ${sourceAgent.id}`,
     `SOURCE_AGENT_NAME: ${sourceAgent.name}`,
     `TASK_ID: ${task.id}`,
     `AGENT_STATUS: ${command.status}`,
+    hasFiles ? `DELIVERABLE_COUNT: ${files.length}` : '',
+    ...fileSection ? [fileSection] : [],
     '',
     'FULL AGENT RESPONSE:',
     rawText
-  ].join('\n');
+  ].filter(line => line !== '').join('\n');
 }
 
 function buildOwnerGateEnvelope(gate) {
@@ -344,6 +789,32 @@ function buildOwnerGateEnvelope(gate) {
     '',
     'Evaluate this owner response and decide the next project action.'
   ].join('\n');
+}
+
+function getFileTypeFromName(fileName) {
+  const ext = fileName.split('.').pop().toLowerCase();
+  const mimeTypes = {
+    'zip': 'application/zip',
+    'tar': 'application/x-tar',
+    'gz': 'application/gzip',
+    'md': 'text/markdown',
+    'txt': 'text/plain',
+    'json': 'application/json',
+    'js': 'application/javascript',
+    'py': 'text/x-python',
+    'java': 'text/x-java',
+    'kt': 'text/x-kotlin',
+    'xml': 'application/xml',
+    'yaml': 'text/yaml',
+    'yml': 'text/yaml',
+    'apk': 'application/vnd.android.package-archive',
+    'pdf': 'application/pdf',
+    'png': 'image/png',
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'gif': 'image/gif'
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
 }
 
 function buildValidationCorrection(error, sourceType, activeTaskId = null) {
@@ -362,6 +833,40 @@ function buildValidationCorrection(error, sourceType, activeTaskId = null) {
     lines.push(`Keep TASK_ID exactly: ${activeTaskId}`);
     lines.push('Agents must use action TASK_RESULT.');
   }
+  
+  // Add helpful hints for common errors
+  if (error.includes('status')) {
+    lines.push('');
+    lines.push('HINT: Allowed status values are: COMPLETE, FAILED, ESCALATION_REQUIRED, OWNER_ACTION_REQUIRED');
+    lines.push('(Note: "COMPLETED" is invalid - use "COMPLETE" without the D)');
+  }
+  
+  if (error.includes('task_id') || error.includes('TASK_RESULT requires')) {
+    lines.push('');
+    lines.push('HINT: Make sure to include "task_id": "<your-task-id>" in your response');
+    lines.push('The task_id must match the one from your assignment exactly.');
+  }
+  
+  if (error.includes('action') || error.includes('TASK_RESULT, not')) {
+    lines.push('');
+    lines.push('HINT: Agents must use "action": "TASK_RESULT" (not TASK_RESULTS, RESULT, or other variants)');
+  }
+  
+  if (error.includes('JSON') || error.includes('Invalid JSON')) {
+    lines.push('');
+    lines.push('HINT: Check your JSON syntax:');
+    lines.push('- All keys must be in double quotes: "key" not key');
+    lines.push('- All string values must be in double quotes: "value" not value');
+    lines.push('- No trailing commas after the last item in objects or arrays');
+    lines.push('- Use proper escaping for quotes inside strings');
+  }
+  
+  if (error.includes('assigned to') || error.includes('Unknown task_id')) {
+    lines.push('');
+    lines.push('HINT: Verify that your task_id matches an existing task assigned to you.');
+    lines.push('If you see "Unknown task_id", the task may have been completed already or has a different ID.');
+  }
+  
   return lines.join('\n');
 }
 
@@ -391,6 +896,10 @@ async function executePmCommand(state, sourceAgentId, command) {
       const taskId = String(command.task_id).trim();
       const targetAgentId = normalizeAgentId(command.target_agent_id);
       const targetAgent = state.agents[targetAgentId];
+      
+      // Retrieve any existing files for this task from previous agents
+      const existingFiles = await getFilesForTask(taskId);
+      
       const task = {
         id: taskId,
         createdByAgentId: sourceAgentId,
@@ -399,18 +908,19 @@ async function executePmCommand(state, sourceAgentId, command) {
         status: 'DISPATCHING',
         agentStatus: null,
         assignment: command.assignment,
+        attachedFiles: existingFiles, // Include file metadata in task
         createdAt: nowIso(),
         updatedAt: nowIso(),
         attempts: 1
       };
       state.tasks[taskId] = task;
-      logEvent(state, 'TASK_CREATED', { taskId, targetAgentId, returnToAgentId: sourceAgentId });
+      logEvent(state, 'TASK_CREATED', { taskId, targetAgentId, returnToAgentId: sourceAgentId, fileCount: existingFiles.length });
 
       try {
-        await dispatchMessageToAgent(state, targetAgentId, buildAgentAssignment(task, targetAgent), taskId);
+        await dispatchMessageToAgent(state, targetAgentId, buildAgentAssignment(task, targetAgent, existingFiles), taskId);
         task.status = 'RUNNING';
         task.updatedAt = nowIso();
-        logEvent(state, 'TASK_DISPATCHED', { taskId, targetAgentId });
+        logEvent(state, 'TASK_DISPATCHED', { taskId, targetAgentId, fileCount: existingFiles.length });
       } catch (error) {
         task.status = 'FAILED';
         task.error = String(error.message || error);
@@ -477,13 +987,77 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
   task.fullResult = rawText;
   task.status = 'RESULT_RECEIVED';
   task.updatedAt = nowIso();
-  logEvent(state, 'TASK_RESULT_RECEIVED', { taskId: task.id, sourceAgentId, agentStatus: command.status });
+  
+  // Check if the command contains deliverables with sandbox paths
+  // If so, we need to request file content from the agent's browser context
+  let files = await getFilesForTask(task.id);
+  const deliverables = command.deliverables || [];
+  
+  // Process any sandbox: paths in deliverables that haven't been stored yet
+  for (const deliv of deliverables) {
+    if (deliv.path && deliv.path.startsWith('sandbox:')) {
+      const existingFileId = `${task.id}:${deliv.name}`;
+      const alreadyStored = files.some(f => f.fileId === existingFileId);
+      
+      if (!alreadyStored) {
+        // Request the agent to read and store this file
+        try {
+          const tabId = sourceAgent.tabId;
+          if (tabId) {
+            const filePath = deliv.path.replace('sandbox:', '');
+            const readResult = await sendToTab(tabId, {
+              type: 'AUTOMATOR_READ_FILE',
+              filePath,
+              fileName: deliv.name,
+              taskId: task.id,
+              sha256: deliv.sha256
+            });
+            
+            if (readResult && readResult.ok && readResult.dataUrl) {
+              // Store the file in sidecar
+              await storeFileForTask(
+                task.id,
+                deliv.name,
+                getFileTypeFromName(deliv.name),
+                readResult.dataUrl,
+                {
+                  uploadedByAgentId: sourceAgentId,
+                  sha256: deliv.sha256,
+                  description: deliv.description || ''
+                }
+              );
+              // Refresh files list
+              files = await getFilesForTask(task.id);
+              logEvent(state, 'FILE_AUTO_EXTRACTED_FROM_SANDBOX', {
+                taskId: task.id,
+                fileName: deliv.name,
+                filePath
+              });
+            }
+          }
+        } catch (readError) {
+          logEvent(state, 'FILE_EXTRACTION_FAILED', {
+            taskId: task.id,
+            fileName: deliv.name,
+            error: String(readError.message || readError)
+          });
+        }
+      }
+    }
+  }
+  
+  logEvent(state, 'TASK_RESULT_RECEIVED', { 
+    taskId: task.id, 
+    sourceAgentId, 
+    agentStatus: command.status,
+    deliverableCount: files.length
+  });
 
   try {
     await dispatchMessageToAgent(
       state,
       task.returnToAgentId,
-      buildPmResultEnvelope(sourceAgent, task, command, rawText),
+      buildPmResultEnvelope(sourceAgent, task, command, rawText, files),
       task.id
     );
     task.status = 'PM_REVIEW';
@@ -492,7 +1066,8 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
     logEvent(state, 'RESULT_RETURNED_TO_PM', {
       taskId: task.id,
       sourceAgentId,
-      returnToAgentId: task.returnToAgentId
+      returnToAgentId: task.returnToAgentId,
+      fileCount: files.length
     });
   } catch (error) {
     task.status = 'RESULT_RETURN_FAILED';
@@ -541,7 +1116,7 @@ async function handleAssistantOutput(tabId, payload) {
       return;
     }
 
-    if (parsed.error) {
+    if (parsed.error && !parsed.extracted) {
       await sendValidationCorrection(state, sourceAgentId, parsed.error);
       state.lastProcessedByAgent[sourceAgentId] = fingerprint;
       return;
@@ -560,6 +1135,15 @@ async function handleAssistantOutput(tabId, payload) {
       await sendValidationCorrection(state, sourceAgentId, validationError);
       state.lastProcessedByAgent[sourceAgentId] = fingerprint;
       return;
+    }
+
+    // If we extracted/corrected the command, log it for visibility
+    if (parsed.extracted) {
+      logEvent(state, 'INTENTION_EXTRACTED', {
+        sourceAgentId,
+        correction: parsed.error,
+        command: command.action
+      });
     }
 
     if (sourceAgent?.type === 'PM') {
@@ -821,6 +1405,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await saveState(structuredClone(DEFAULT_STATE));
         sendResponse({ ok: true, state: await loadState() });
         return;
+
+      // File Sidecar API for storing deliverables between agents
+      case 'AUTOMATOR_STORE_FILE': {
+        const { taskId, fileName, fileType, dataUrl, metadata } = message;
+        if (!taskId || !fileName || !dataUrl) {
+          throw new Error('taskId, fileName, and dataUrl are required');
+        }
+        try {
+          const result = await storeFileForTask(taskId, fileName, fileType || 'application/octet-stream', dataUrl, metadata);
+          sendResponse({ ok: true, ...result });
+        } catch (error) {
+          sendResponse({ ok: false, error: error.message });
+        }
+        return;
+      }
+
+      case 'AUTOMATOR_GET_FILES': {
+        const { taskId } = message;
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        const files = await getFilesForTask(taskId);
+        sendResponse({ ok: true, files });
+        return;
+      }
+
+      case 'AUTOMATOR_GET_FILE_DATA': {
+        const { fileId } = message;
+        if (!fileId) {
+          throw new Error('fileId is required');
+        }
+        const fileData = await getFileData(fileId);
+        sendResponse({ ok: true, file: fileData });
+        return;
+      }
+
+      case 'AUTOMATOR_DELETE_FILE': {
+        const { fileId } = message;
+        if (!fileId) {
+          throw new Error('fileId is required');
+        }
+        await deleteFileFromSidecar(fileId);
+        sendResponse({ ok: true });
+        return;
+      }
+
+      case 'AUTOMATOR_CLEAR_TASK_FILES': {
+        const { taskId } = message;
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        await clearTaskFiles(taskId);
+        sendResponse({ ok: true });
+        return;
+      }
+
+      case 'AUTOMATOR_GET_STORAGE_INFO': {
+        const totalSize = await getTotalStorageSize();
+        sendResponse({
+          ok: true,
+          usedBytes: totalSize,
+          usedMB: (totalSize / 1024 / 1024).toFixed(2),
+          maxBytes: MAX_TOTAL_STORAGE_BYTES,
+          maxMB: (MAX_TOTAL_STORAGE_BYTES / 1024 / 1024).toFixed(2),
+          percentUsed: ((totalSize / MAX_TOTAL_STORAGE_BYTES) * 100).toFixed(1)
+        });
+        return;
+      }
 
       default:
         sendResponse({ ok: false, error: 'Unknown message type' });
