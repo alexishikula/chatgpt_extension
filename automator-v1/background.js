@@ -173,7 +173,18 @@ function parseProtocol(text) {
     try {
       const parsed = JSON.parse(match[1]);
       // Check if status needs correction even if JSON is valid
-      const corrected = normalizeStatusInCommand(parsed);
+      let corrected = normalizeStatusInCommand(parsed);
+      if (corrected) {
+        return {
+          found: true,
+          command: corrected.command,
+          error: corrected.error,
+          raw: match[1],
+          extracted: true
+        };
+      }
+      // Check if action needs correction
+      corrected = normalizeActionInCommand(parsed);
       if (corrected) {
         return {
           found: true,
@@ -185,6 +196,37 @@ function parseProtocol(text) {
       }
       return { found: true, command: parsed, error: null, raw: match[1] };
     } catch (error) {
+      // Try to fix malformed JSON and re-parse
+      const fixed = fixMalformedJsonAndExtract(match[1]);
+      if (fixed) {
+        let corrected = normalizeStatusInCommand(fixed.parsed);
+        if (corrected) {
+          return {
+            found: true,
+            command: corrected.command,
+            error: `Fixed JSON syntax and status: ${corrected.error}`,
+            raw: fixed.raw,
+            extracted: true
+          };
+        }
+        corrected = normalizeActionInCommand(fixed.parsed);
+        if (corrected) {
+          return {
+            found: true,
+            command: corrected.command,
+            error: `Fixed JSON syntax and action: ${corrected.error}`,
+            raw: fixed.raw,
+            extracted: true
+          };
+        }
+        return {
+          found: true,
+          command: fixed.parsed,
+          error: 'Fixed JSON syntax errors',
+          raw: fixed.raw,
+          extracted: true
+        };
+      }
       return {
         found: true,
         command: null,
@@ -218,9 +260,13 @@ function normalizeStatusInCommand(command) {
   
   const statusMap = {
     'COMPLETED': 'COMPLETE',
+    'COMPLETE_TASK': 'COMPLETE',
     'FAIL': 'FAILED',
+    'FAILURE': 'FAILED',
     'ESCALATE': 'ESCALATION_REQUIRED',
-    'OWNER_ACTION': 'OWNER_ACTION_REQUIRED'
+    'ESCALATION': 'ESCALATION_REQUIRED',
+    'OWNER_ACTION': 'OWNER_ACTION_REQUIRED',
+    'OWNER_APPROVAL': 'OWNER_ACTION_REQUIRED'
   };
   
   const originalStatus = String(command.status || '');
@@ -231,6 +277,79 @@ function normalizeStatusInCommand(command) {
       command: { ...command, status: normalized },
       error: `Status value corrected: "${originalStatus}" → "${normalized}"`
     };
+  }
+  
+  return null;
+}
+
+/**
+ * Normalize common action typos in already-parsed commands.
+ * Returns corrected command if action was normalized, null otherwise.
+ */
+function normalizeActionInCommand(command) {
+  if (!command || typeof command !== 'object') return null;
+  
+  const actionMap = {
+    'TASK_RESULTS': 'TASK_RESULT',
+    'RESULT': 'TASK_RESULT',
+    'DISPATCH': 'DISPATCH_TASK',
+    'DISPATCH_ASSIGNMENT': 'DISPATCH_TASK',
+    'REQUEST_APPROVAL': 'REQUEST_OWNER_APPROVAL',
+    'REQUEST_ACTION': 'REQUEST_OWNER_ACTION',
+    'CANCEL': 'CANCEL_TASK',
+    'COMPLETE': 'COMPLETE_TASK',
+    'PAUSE': 'PAUSE_PROJECT',
+    'FINISH_PROJECT': 'COMPLETE_PROJECT'
+  };
+  
+  const originalAction = String(command.action || '');
+  const normalized = actionMap[originalAction];
+  
+  if (normalized) {
+    return {
+      command: { ...command, action: normalized },
+      error: `Action value corrected: "${originalAction}" → "${normalized}"`
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Attempt to fix common JSON structure issues and extract fields.
+ */
+function fixMalformedJsonAndExtract(text) {
+  if (!text || typeof text !== 'string') return null;
+  
+  // Try to find and extract JSON object even without proper wrappers
+  const jsonPatterns = [
+    /\{[\s\S]*"action"[\s\S]*\}/,
+    /\{[\s\S]*"task_id"[\s\S]*\}/,
+    /\{[\s\S]*"status"[\s\S]*\}/
+  ];
+  
+  for (const pattern of jsonPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      let jsonStr = match[0];
+      
+      // Fix common JSON syntax errors
+      // Missing quotes around keys
+      jsonStr = jsonStr.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
+      
+      // Trailing commas
+      jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1');
+      
+      // Unquoted string values (basic cases)
+      jsonStr = jsonStr.replace(/:\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*([,}\n])/g, ': "$1"$2');
+      
+      try {
+        const parsed = JSON.parse(jsonStr);
+        return { parsed, raw: jsonStr };
+      } catch (_) {
+        continue;
+      }
+    }
   }
   
   return null;
@@ -253,10 +372,10 @@ function extractIntentionFromText(text) {
   
   // Look for status patterns with fuzzy matching
   const statusCandidates = [
-    { pattern: /status["\s:=]+\s*"?(COMPLETE|COMPLETED)"?/i, normalize: 'COMPLETE' },
-    { pattern: /status["\s:=]+\s*"?(FAILED|FAIL)"?/i, normalize: 'FAILED' },
-    { pattern: /status["\s:=]+\s*"?(ESCALATION_REQUIRED|ESCALATE)"?/i, normalize: 'ESCALATION_REQUIRED' },
-    { pattern: /status["\s:=]+\s*"?(OWNER_ACTION_REQUIRED|OWNER_ACTION)"?/i, normalize: 'OWNER_ACTION_REQUIRED' }
+    { pattern: /status["\\s:=]+\\s*"(COMPLETE|COMPLETED)"?/i, normalize: 'COMPLETE' },
+    { pattern: /status["\\s:=]+\\s*"(FAILED|FAIL)"?/i, normalize: 'FAILED' },
+    { pattern: /status["\\s:=]+\\s*"(ESCALATION_REQUIRED|ESCALATE)"?/i, normalize: 'ESCALATION_REQUIRED' },
+    { pattern: /status["\\s:=]+\\s*"(OWNER_ACTION_REQUIRED|OWNER_ACTION)"?/i, normalize: 'OWNER_ACTION_REQUIRED' }
   ];
   
   let status = null;
@@ -268,12 +387,47 @@ function extractIntentionFromText(text) {
     }
   }
   
+  // Look for action patterns
+  const actionCandidates = [
+    { pattern: /action["\\s:=]+\\s*"?TASK_RESULT["\\s]?/i, normalize: 'TASK_RESULT' },
+    { pattern: /action["\\s:=]+\\s*"?DISPATCH_TASK["\\s]?/i, normalize: 'DISPATCH_TASK' },
+    { pattern: /action["\\s:=]+\\s*"?REQUEST_OWNER_APPROVAL["\\s]?/i, normalize: 'REQUEST_OWNER_APPROVAL' },
+    { pattern: /action["\\s:=]+\\s*"?REQUEST_OWNER_ACTION["\\s]?/i, normalize: 'REQUEST_OWNER_ACTION' }
+  ];
+  
+  let action = null;
+  for (const candidate of actionCandidates) {
+    const match = text.match(candidate.pattern);
+    if (match) {
+      action = candidate.normalize;
+      break;
+    }
+  }
+  
   // Look for summary or description
-  const summaryMatch = text.match(/summary["\s:=]+\s*"([^"]+)"/i) ||
-                       text.match(/description["\s:=]+\s*"([^"]+)"/i);
+  const summaryMatch = text.match(/summary["\\s:=]+\\s*"([^"]+)"/i) ||
+                       text.match(/description["\\s:=]+\\s*"([^"]+)"/i);
   const summary = summaryMatch ? summaryMatch[1].trim() : null;
   
-  // Only return extracted data if we have at least task_id and status
+  // Extract deliverables if present
+  let deliverables = null;
+  const deliverablesMatch = text.match(/deliverables["\\s:=]+\\s*(\\[.*?\\]|\\{.*?\\})/is);
+  if (deliverablesMatch) {
+    try {
+      deliverables = JSON.parse(deliverablesMatch[1]);
+    } catch (_) {}
+  }
+  
+  // Extract validation if present
+  let validation = null;
+  const validationMatch = text.match(/validation["\\s:=]+\\s*(\\{[^}]*\\})/is);
+  if (validationMatch) {
+    try {
+      validation = JSON.parse(validationMatch[1]);
+    } catch (_) {}
+  }
+  
+  // For TASK_RESULT actions, we need at least task_id and status
   if (taskId && status) {
     const extractedCommand = {
       action: 'TASK_RESULT',
@@ -282,13 +436,27 @@ function extractIntentionFromText(text) {
       summary: summary || ''
     };
     
-    const error = status !== extractedCommand.status 
-      ? `Status value corrected: original had typo or variant`
-      : 'Extracted from unstructured text (missing protocol wrapper)';
+    if (deliverables) extractedCommand.deliverables = deliverables;
+    if (validation) extractedCommand.validation = validation;
     
     return {
       command: extractedCommand,
-      error: error,
+      error: 'Extracted from unstructured text (missing protocol wrapper or typos corrected)',
+      raw: text.substring(0, 500) + (text.length > 500 ? '...' : '')
+    };
+  }
+  
+  // For PM actions, we need task_id and action
+  if (taskId && action && action !== 'TASK_RESULT') {
+    const extractedCommand = {
+      action: action,
+      task_id: taskId,
+      summary: summary || ''
+    };
+    
+    return {
+      command: extractedCommand,
+      error: 'Extracted PM action from unstructured text',
       raw: text.substring(0, 500) + (text.length > 500 ? '...' : '')
     };
   }
@@ -480,6 +648,32 @@ function buildValidationCorrection(error, sourceType, activeTaskId = null) {
     lines.push('');
     lines.push('HINT: Allowed status values are: COMPLETE, FAILED, ESCALATION_REQUIRED, OWNER_ACTION_REQUIRED');
     lines.push('(Note: "COMPLETED" is invalid - use "COMPLETE" without the D)');
+  }
+  
+  if (error.includes('task_id') || error.includes('TASK_RESULT requires')) {
+    lines.push('');
+    lines.push('HINT: Make sure to include "task_id": "<your-task-id>" in your response');
+    lines.push('The task_id must match the one from your assignment exactly.');
+  }
+  
+  if (error.includes('action') || error.includes('TASK_RESULT, not')) {
+    lines.push('');
+    lines.push('HINT: Agents must use "action": "TASK_RESULT" (not TASK_RESULTS, RESULT, or other variants)');
+  }
+  
+  if (error.includes('JSON') || error.includes('Invalid JSON')) {
+    lines.push('');
+    lines.push('HINT: Check your JSON syntax:');
+    lines.push('- All keys must be in double quotes: "key" not key');
+    lines.push('- All string values must be in double quotes: "value" not value');
+    lines.push('- No trailing commas after the last item in objects or arrays');
+    lines.push('- Use proper escaping for quotes inside strings');
+  }
+  
+  if (error.includes('assigned to') || error.includes('Unknown task_id')) {
+    lines.push('');
+    lines.push('HINT: Verify that your task_id matches an existing task assigned to you.');
+    lines.push('If you see "Unknown task_id", the task may have been completed already or has a different ID.');
   }
   
   return lines.join('\n');

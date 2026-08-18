@@ -30,10 +30,28 @@ Allowed status values (exact spelling required):
 COMMON MISTAKES TO AVOID:
 ✗ "COMPLETED" → ✓ "COMPLETE"
 ✗ "FAIL" → ✓ "FAILED"  
+✗ "TASK_RESULTS" or "RESULT" → ✓ "TASK_RESULT"
 ✗ Missing <<AUTOMATOR>> wrappers
 ✗ Wrong task_id or altered identifier
+✗ Invalid JSON syntax (unquoted keys, trailing commas, etc.)
+
+JSON SYNTAX REQUIREMENTS:
+- All object keys MUST be in double quotes: "key" not key
+- All string values MUST be in double quotes: "value" not value
+- No trailing commas after the last item in objects or arrays
+- Use proper escaping for quotes inside strings: \"
 
 Examples:
+
+Successful completion:
+<<AUTOMATOR>>
+{
+  "action": "TASK_RESULT",
+  "task_id": "NATIVE-APP-001",
+  "status": "COMPLETE",
+  "summary": "Completed the Android TV foundation. APK deferred due to missing SDK."
+}
+<<END_AUTOMATOR>>
 
 Escalation:
 <<AUTOMATOR>>
@@ -55,6 +73,16 @@ Physical/owner action needed:
 }
 <<END_AUTOMATOR>>
 
+Failure:
+<<AUTOMATOR>>
+{
+  "action": "TASK_RESULT",
+  "task_id": "THE_EXACT_TASK_ID_YOU_RECEIVED",
+  "status": "FAILED",
+  "summary": "Explain what went wrong and any partial results."
+}
+<<END_AUTOMATOR>>
+
 RULES
 - Never invent or alter task_id.
 - Never choose a destination for your result. Automator returns it to the PM automatically.
@@ -63,3 +91,4 @@ RULES
 - If the requested work exceeds your authority, return ESCALATION_REQUIRED instead of redesigning the system.
 - Your full prose response is relayed to PM. The JSON block is the machine-readable completion signal.
 - Normal prose may appear before the block, but only one AUTOMATOR block may appear in the final answer.
+- The automator has lenient parsing that can recover common mistakes, but you should always use correct format.
