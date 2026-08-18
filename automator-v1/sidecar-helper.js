@@ -7,6 +7,10 @@
  * Usage in browser console or content script:
  *   const sidecar = new AutomatorSidecarHelper();
  *   await sidecar.storeFile(taskId, fileObject);
+ *   
+ * The sidecar automatically transfers files between agents on the same task.
+ * When you complete a task with files, they are stored. When the next agent
+ * is dispatched on that task, they will see the files listed in their assignment.
  */
 
 class AutomatorSidecarHelper {
@@ -259,9 +263,13 @@ class AutomatorSidecarHelper {
   }
 }
 
+// Auto-instantiate for convenience
+if (typeof window !== 'undefined') {
+  window.sidecar = new AutomatorSidecarHelper();
+  window.AutomatorSidecarHelper = AutomatorSidecarHelper;
+}
+
 // Export for use as module or global
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = AutomatorSidecarHelper;
-} else {
-  window.AutomatorSidecarHelper = AutomatorSidecarHelper;
 }

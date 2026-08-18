@@ -151,3 +151,22 @@ RULES
 - Normal prose may appear before the block, but only one AUTOMATOR block may appear in the final answer.
 - The automator has lenient parsing that can recover common mistakes, but you should always use correct format.
 - For file deliverables, store them in the sidecar BEFORE returning TASK_RESULT so the PM can access them.
+- Files you store will automatically be available to the next agent dispatched on the same task via the sidecar.
+
+RECEIVING FILES FROM PREVIOUS AGENTS:
+When you are dispatched a task that has file deliverables from a previous agent, you will see an "ATTACHED DELIVERABLES" section in your assignment message. To access these files:
+
+```javascript
+// Get list of files for this task
+const files = await sidecar.getFiles('YOUR-TASK-ID');
+console.log('Available files:', files);
+
+// Download a specific file (triggers browser download)
+await sidecar.downloadFile('TASK-ID:fileName.zip');
+
+// Or get raw data for processing
+const fileData = await sidecar.getFileData('TASK-ID:fileName.zip');
+console.log(fileData.dataUrl); // base64 data URL
+```
+
+The sidecar helper is automatically available in your browser context. Use it to access any files stored by previous agents on the same task.

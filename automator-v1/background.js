@@ -695,10 +695,28 @@ async function resolveTabForAgent(state, agentId) {
 async function dispatchMessageToAgent(state, agentId, text, taskId = null) {
   const targetId = normalizeAgentId(agentId);
   const tab = await resolveTabForAgent(state, targetId);
+  
+  // If there are files in the sidecar for this task, include file metadata in the message
+  let enrichedText = text;
+  if (taskId) {
+    const files = await getFilesForTask(taskId);
+    if (files && files.length > 0) {
+      const fileList = files.map(f => `- ${f.fileName} (${f.fileType}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`).join('\n');
+      enrichedText = text + '\n\n---\nATTACHED DELIVERABLES FROM PREVIOUS AGENT:\n' + fileList + 
+                     '\n\nUse sidecar.getFileData(fileId) to retrieve each file.';
+    }
+  }
+  
   const response = await sendToTab(tab.id, {
     type: 'AUTOMATOR_SEND_MESSAGE',
-    text,
+    text: enrichedText,
     taskId
+  });
+  logEvent(state, 'DISPATCH_MESSAGE_TO_AGENT', { 
+    targetAgentId: targetId, 
+    tabId: tab.id, 
+    chars: text.length,
+    hasFiles: taskId ? (await getFilesForTask(taskId)).length > 0 : false
   });
   if (!response?.ok) throw new Error(response?.error || `Could not send to ${targetId}`);
   return response;
@@ -722,17 +740,30 @@ function buildAgentAssignment(task, targetAgent) {
   ].join('\n');
 }
 
-function buildPmResultEnvelope(sourceAgent, task, command, rawText) {
+function buildPmResultEnvelope(sourceAgent, task, command, rawText, files = []) {
+  const hasFiles = files && files.length > 0;
+  const fileSection = hasFiles 
+    ? [
+        '',
+        'ATTACHED DELIVERABLES:',
+        ...files.map(f => `- ${f.fileName} (${f.fileType}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`),
+        '',
+        'Use sidecar.getFileData(fileId) to retrieve each file.'
+      ].join('\n')
+    : '';
+  
   return [
     'AUTOMATOR AGENT RETURN',
     `SOURCE_AGENT_ID: ${sourceAgent.id}`,
     `SOURCE_AGENT_NAME: ${sourceAgent.name}`,
     `TASK_ID: ${task.id}`,
     `AGENT_STATUS: ${command.status}`,
+    hasFiles ? `DELIVERABLE_COUNT: ${files.length}` : '',
+    ...fileSection ? [fileSection] : [],
     '',
     'FULL AGENT RESPONSE:',
     rawText
-  ].join('\n');
+  ].filter(line => line !== '').join('\n');
 }
 
 function buildOwnerGateEnvelope(gate) {
@@ -912,13 +943,22 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
   task.fullResult = rawText;
   task.status = 'RESULT_RECEIVED';
   task.updatedAt = nowIso();
-  logEvent(state, 'TASK_RESULT_RECEIVED', { taskId: task.id, sourceAgentId, agentStatus: command.status });
+  
+  // Retrieve any files stored in sidecar for this task
+  const files = await getFilesForTask(task.id);
+  
+  logEvent(state, 'TASK_RESULT_RECEIVED', { 
+    taskId: task.id, 
+    sourceAgentId, 
+    agentStatus: command.status,
+    deliverableCount: files.length
+  });
 
   try {
     await dispatchMessageToAgent(
       state,
       task.returnToAgentId,
-      buildPmResultEnvelope(sourceAgent, task, command, rawText),
+      buildPmResultEnvelope(sourceAgent, task, command, rawText, files),
       task.id
     );
     task.status = 'PM_REVIEW';
@@ -927,7 +967,8 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
     logEvent(state, 'RESULT_RETURNED_TO_PM', {
       taskId: task.id,
       sourceAgentId,
-      returnToAgentId: task.returnToAgentId
+      returnToAgentId: task.returnToAgentId,
+      fileCount: files.length
     });
   } catch (error) {
     task.status = 'RESULT_RETURN_FAILED';
