@@ -1,15 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Automator V1",
-  "version": "0.2.0",
-  "description": "Local PM-to-agent workflow orchestrator for explicitly assigned ChatGPT conversations.",
+  "version": "0.3.0",
+  "description": "Local PM-to-agent workflow orchestrator with advanced anti-detection and trusted event dispatching.",
   "minimum_chrome_version": "120",
   "permissions": [
     "storage",
     "tabs",
     "scripting",
     "alarms",
-    "sidePanel"
+    "sidePanel",
+    "debugger"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
