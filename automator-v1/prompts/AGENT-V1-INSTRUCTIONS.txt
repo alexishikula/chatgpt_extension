@@ -21,11 +21,17 @@ When your assignment reaches a terminal result, end your response with EXACTLY O
 }
 <<END_AUTOMATOR>>
 
-Allowed status values:
-- COMPLETE
-- FAILED
+Allowed status values (exact spelling required):
+- COMPLETE       (NOT "COMPLETED" - no trailing D)
+- FAILED         (NOT "FAIL")
 - ESCALATION_REQUIRED
 - OWNER_ACTION_REQUIRED
+
+COMMON MISTAKES TO AVOID:
+✗ "COMPLETED" → ✓ "COMPLETE"
+✗ "FAIL" → ✓ "FAILED"  
+✗ Missing <<AUTOMATOR>> wrappers
+✗ Wrong task_id or altered identifier
 
 Examples:
 

@@ -171,7 +171,19 @@ function parseProtocol(text) {
     const match = text.match(pattern);
     if (!match) continue;
     try {
-      return { found: true, command: JSON.parse(match[1]), error: null, raw: match[1] };
+      const parsed = JSON.parse(match[1]);
+      // Check if status needs correction even if JSON is valid
+      const corrected = normalizeStatusInCommand(parsed);
+      if (corrected) {
+        return {
+          found: true,
+          command: corrected.command,
+          error: corrected.error,
+          raw: match[1],
+          extracted: true
+        };
+      }
+      return { found: true, command: parsed, error: null, raw: match[1] };
     } catch (error) {
       return {
         found: true,
@@ -181,7 +193,107 @@ function parseProtocol(text) {
       };
     }
   }
+  
+  // Lenient fallback: attempt to extract intention from malformed output
+  const extracted = extractIntentionFromText(text);
+  if (extracted) {
+    return {
+      found: true,
+      command: extracted.command,
+      error: extracted.error,
+      raw: extracted.raw,
+      extracted: true
+    };
+  }
+  
   return { found: false, command: null, error: null };
+}
+
+/**
+ * Normalize common status typos in already-parsed commands.
+ * Returns corrected command if status was normalized, null otherwise.
+ */
+function normalizeStatusInCommand(command) {
+  if (!command || typeof command !== 'object') return null;
+  
+  const statusMap = {
+    'COMPLETED': 'COMPLETE',
+    'FAIL': 'FAILED',
+    'ESCALATE': 'ESCALATION_REQUIRED',
+    'OWNER_ACTION': 'OWNER_ACTION_REQUIRED'
+  };
+  
+  const originalStatus = String(command.status || '');
+  const normalized = statusMap[originalStatus];
+  
+  if (normalized) {
+    return {
+      command: { ...command, status: normalized },
+      error: `Status value corrected: "${originalStatus}" → "${normalized}"`
+    };
+  }
+  
+  return null;
+}
+
+/**
+ * Attempt to extract task result intention from unstructured or malformed text.
+ * This allows the automator to recover common mistakes like:
+ * - Missing protocol wrappers
+ * - Typos in status values (e.g., "COMPLETED" vs "COMPLETE")
+ * - Partial JSON structures
+ */
+function extractIntentionFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  
+  // Look for task_id patterns
+  const taskIdMatch = text.match(/task_id["\s:=]+([A-Z0-9_-]+)/i) ||
+                      text.match(/TASK_ID[:\s]+([A-Z0-9_-]+)/i);
+  const taskId = taskIdMatch ? taskIdMatch[1].trim() : null;
+  
+  // Look for status patterns with fuzzy matching
+  const statusCandidates = [
+    { pattern: /status["\s:=]+\s*"?(COMPLETE|COMPLETED)"?/i, normalize: 'COMPLETE' },
+    { pattern: /status["\s:=]+\s*"?(FAILED|FAIL)"?/i, normalize: 'FAILED' },
+    { pattern: /status["\s:=]+\s*"?(ESCALATION_REQUIRED|ESCALATE)"?/i, normalize: 'ESCALATION_REQUIRED' },
+    { pattern: /status["\s:=]+\s*"?(OWNER_ACTION_REQUIRED|OWNER_ACTION)"?/i, normalize: 'OWNER_ACTION_REQUIRED' }
+  ];
+  
+  let status = null;
+  for (const candidate of statusCandidates) {
+    const match = text.match(candidate.pattern);
+    if (match) {
+      status = candidate.normalize;
+      break;
+    }
+  }
+  
+  // Look for summary or description
+  const summaryMatch = text.match(/summary["\s:=]+\s*"([^"]+)"/i) ||
+                       text.match(/description["\s:=]+\s*"([^"]+)"/i);
+  const summary = summaryMatch ? summaryMatch[1].trim() : null;
+  
+  // Only return extracted data if we have at least task_id and status
+  if (taskId && status) {
+    const extractedCommand = {
+      action: 'TASK_RESULT',
+      task_id: taskId,
+      status: status,
+      summary: summary || ''
+    };
+    
+    const error = status !== extractedCommand.status 
+      ? `Status value corrected: original had typo or variant`
+      : 'Extracted from unstructured text (missing protocol wrapper)';
+    
+    return {
+      command: extractedCommand,
+      error: error,
+      raw: text.substring(0, 500) + (text.length > 500 ? '...' : '')
+    };
+  }
+  
+  return null;
 }
 
 function validatePmCommand(state, command) {
@@ -362,6 +474,14 @@ function buildValidationCorrection(error, sourceType, activeTaskId = null) {
     lines.push(`Keep TASK_ID exactly: ${activeTaskId}`);
     lines.push('Agents must use action TASK_RESULT.');
   }
+  
+  // Add helpful hints for common errors
+  if (error.includes('status')) {
+    lines.push('');
+    lines.push('HINT: Allowed status values are: COMPLETE, FAILED, ESCALATION_REQUIRED, OWNER_ACTION_REQUIRED');
+    lines.push('(Note: "COMPLETED" is invalid - use "COMPLETE" without the D)');
+  }
+  
   return lines.join('\n');
 }
 
@@ -541,7 +661,7 @@ async function handleAssistantOutput(tabId, payload) {
       return;
     }
 
-    if (parsed.error) {
+    if (parsed.error && !parsed.extracted) {
       await sendValidationCorrection(state, sourceAgentId, parsed.error);
       state.lastProcessedByAgent[sourceAgentId] = fingerprint;
       return;
@@ -560,6 +680,15 @@ async function handleAssistantOutput(tabId, payload) {
       await sendValidationCorrection(state, sourceAgentId, validationError);
       state.lastProcessedByAgent[sourceAgentId] = fingerprint;
       return;
+    }
+
+    // If we extracted/corrected the command, log it for visibility
+    if (parsed.extracted) {
+      logEvent(state, 'INTENTION_EXTRACTED', {
+        sourceAgentId,
+        correction: parsed.error,
+        command: command.action
+      });
     }
 
     if (sourceAgent?.type === 'PM') {
