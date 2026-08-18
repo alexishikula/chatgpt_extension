@@ -42,44 +42,57 @@ JSON SYNTAX REQUIREMENTS:
 - Use proper escaping for quotes inside strings: \"
 
 STORING FILE DELIVERABLES (ZIP files, binaries, large artifacts):
-When your task produces file deliverables (e.g., .zip, .apk, .tar.gz), use the browser's file sidecar API to store them before returning TASK_RESULT. This ensures the PM can access the actual files, not just metadata.
+When your task produces file deliverables (e.g., .zip, .apk, .tar.gz), you MUST store them in the sidecar BEFORE returning TASK_RESULT. The automator cannot access sandbox: paths directly - files must be explicitly stored via the sidecar API.
 
-To store a file, send a message to the automator background script:
+CRITICAL: Simply listing sandbox: paths in your deliverables is NOT enough. You must actively store each file.
 
-Example using JavaScript in the browser console or content script:
+OPTION 1: Use the convenience helper (recommended):
 ```javascript
-// Convert file to Data URL (base64)
-const fileInput = document.querySelector('input[type="file"]');
-const file = fileInput.files[0];
-const reader = new FileReader();
-reader.onload = (e) => {
-  const dataUrl = e.target.result; // data:application/zip;base64,...
-  
-  // Store in sidecar
-  chrome.runtime.sendMessage(
-    {
-      type: 'AUTOMATOR_STORE_FILE',
-      taskId: 'YOUR-TASK-ID',
-      fileName: 'Northstar-Native-TV-Foundation.zip',
-      fileType: 'application/zip',
-      dataUrl: dataUrl,
-      metadata: {
-        uploadedByAgentId: 'your-agent-id',
-        sha256: 'abc123...',
-        description: 'Android TV foundation APK project'
-      }
-    },
-    (response) => {
-      if (response.ok) {
-        console.log('File stored:', response.fileId);
-      } else {
-        console.error('Storage failed:', response.error);
-      }
-    }
-  );
-};
-reader.readAsDataURL(file);
+// In browser console or as a script
+const sidecar = new AutomatorSidecarHelper();
+
+// Read file from filesystem (Node.js context in Docker)
+const fs = require('fs');
+const path = '/workspace/scratch/318b35efd3bc/deliverables/Northstar-Native-TV-Foundation-NATIVE-APP-001.zip';
+const fileBuffer = fs.readFileSync(path);
+const base64 = fileBuffer.toString('base64');
+const mimeType = 'application/zip';
+const dataUrl = `data:${mimeType};base64,${base64}`;
+
+// Create a File object and store it
+const fileName = 'Northstar-Native-TV-Foundation-NATIVE-APP-001.zip';
+const file = new File([fileBuffer], fileName, { type: mimeType });
+await sidecar.storeFile('NATIVE-APP-001', file, {
+  sha256: '47ba0a2524f17bada984ba280d9bbf58081d924021bbed82625ed16afc5578e8',
+  description: 'Android TV foundation APK project'
+});
+console.log('File stored successfully!');
 ```
+
+OPTION 2: Direct chrome.runtime.sendMessage:
+```javascript
+const fs = require('fs');
+const fileBuffer = fs.readFileSync('/workspace/scratch/318b35efd3bc/deliverables/file.zip');
+const base64 = fileBuffer.toString('base64');
+const dataUrl = `data:application/zip;base64,${base64}`;
+
+chrome.runtime.sendMessage({
+  type: 'AUTOMATOR_STORE_FILE',
+  taskId: 'NATIVE-APP-001',
+  fileName: 'file.zip',
+  fileType: 'application/zip',
+  dataUrl: dataUrl,
+  metadata: {
+    uploadedByAgentId: 'senior_developer_chatgpt_work',
+    sha256: 'abc123...',
+    description: 'Description here'
+  }
+}, (response) => {
+  console.log(response.ok ? 'Stored!' : 'Error:', response);
+});
+```
+
+After storing ALL files, return your TASK_RESULT. Do NOT include sandbox: paths in deliverables unless you have also stored the files.
 
 Then reference the stored file in your TASK_RESULT summary:
 <<AUTOMATOR>>
