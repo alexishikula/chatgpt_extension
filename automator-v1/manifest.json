@@ -9,7 +9,8 @@
     "tabs",
     "scripting",
     "alarms",
-    "sidePanel"
+    "sidePanel",
+    "downloads"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",

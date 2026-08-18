@@ -159,6 +159,26 @@
     });
   }
 
+  // P0 Guard Rail: Extract Markdown links from text content
+  function extractMarkdownLinks(text) {
+    if (!text || typeof text !== 'string') return [];
+    
+    const markdownLinkPattern = /\\[([^\\]]+)\\]\\((sandbox:[^)]+)\\)/gi;
+    const links = [];
+    let match;
+    
+    while ((match = markdownLinkPattern.exec(text)) !== null) {
+      links.push({
+        linkText: match[1],
+        url: match[2],
+        fullPath: match[2].replace('sandbox:', ''),
+        raw: match[0]
+      });
+    }
+    
+    return links;
+  }
+
   // Handle file reading requests from background script
   async function handleReadFileRequest(filePath, fileName, taskId, sha256) {
     try {
@@ -208,7 +228,12 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
       if (message?.type === 'AUTOMATOR_GET_LAST_ASSISTANT') {
-        sendResponse({ ok: true, message: getLastAssistantMessage() });
+        const lastMsg = getLastAssistantMessage();
+        // P0 Guard Rail: Also extract any Markdown links from the message
+        if (lastMsg && lastMsg.text) {
+          lastMsg.markdownLinks = extractMarkdownLinks(lastMsg.text);
+        }
+        sendResponse({ ok: true, message: lastMsg });
         return;
       }
       if (message?.type === 'AUTOMATOR_SEND_MESSAGE') {
@@ -217,19 +242,32 @@
         return;
       }
       if (message?.type === 'AUTOMATOR_GET_PAGE_STATE') {
-        sendResponse({
+        const lastMsg = getLastAssistantMessage();
+        const pageState = {
           ok: true,
           url: location.href,
           streaming: isStreaming(),
           hasComposer: Boolean(findComposer()),
-          lastAssistant: getLastAssistantMessage()
-        });
+          lastAssistant: lastMsg
+        };
+        // P0 Guard Rail: Extract Markdown links from assistant message
+        if (lastMsg && lastMsg.text) {
+          pageState.markdownLinks = extractMarkdownLinks(lastMsg.text);
+        }
+        sendResponse(pageState);
         return;
       }
       if (message?.type === 'AUTOMATOR_READ_FILE') {
         const { filePath, fileName, taskId, sha256 } = message;
         const result = await handleReadFileRequest(filePath, fileName, taskId, sha256);
         sendResponse(result);
+        return;
+      }
+      // P0 Guard Rail: Extract and process Markdown links from current page
+      if (message?.type === 'AUTOMATOR_EXTRACT_MARKDOWN_LINKS') {
+        const lastMsg = getLastAssistantMessage();
+        const links = lastMsg && lastMsg.text ? extractMarkdownLinks(lastMsg.text) : [];
+        sendResponse({ ok: true, links, text: lastMsg?.text || '' });
         return;
       }
       sendResponse({ ok: false, error: 'Unknown content-script message' });

@@ -631,7 +631,7 @@ function validatePmCommand(state, command) {
   return null;
 }
 
-function validateAgentResult(state, sourceAgentId, command) {
+async function validateAgentResult(state, sourceAgentId, command) {
   if (!command || typeof command !== 'object' || Array.isArray(command)) return 'Result must be a JSON object.';
   if (command.action !== 'TASK_RESULT') return `Agents may only return action TASK_RESULT, not ${command.action || '(missing)'}.`;
   const taskId = String(command.task_id || '').trim();
@@ -645,6 +645,41 @@ function validateAgentResult(state, sourceAgentId, command) {
     return `Unsupported TASK_RESULT status: ${command.status || '(missing)'}.`;
   }
   if (TERMINAL_TASK_STATES.has(task.status)) return `Task ${taskId} is already ${task.status}.`;
+  
+  // P0 Guard Rail: Validate download_url if present in command
+  if (command.download_url) {
+    const urlPattern = /^https?:\/\/.+/i;
+    if (!urlPattern.test(command.download_url)) {
+      return 'download_url must be a valid HTTP/HTTPS URL';
+    }
+    
+    // Check if matching file exists in sidecar for this task
+    const files = await getFilesForTask(taskId);
+    if (files.length > 0) {
+      const hasMatchingFile = files.some(f => 
+        command.download_url.includes(f.fileName) || 
+        command.download_url.toLowerCase().includes(f.fileName.toLowerCase())
+      );
+      
+      if (!hasMatchingFile) {
+        logEvent(state, 'DOWNLOAD_URL_MISMATCH_WARNING', {
+          taskId,
+          downloadUrl: command.download_url,
+          availableFiles: files.map(f => f.fileName)
+        });
+        // Note: This is a warning, not a rejection - the PM should review
+        command.requiresPmReview = true;
+      }
+    } else {
+      // No files in sidecar but download_url provided - flag for PM review
+      command.requiresPmReview = true;
+      logEvent(state, 'DOWNLOAD_URL_WITHOUT_SIDECAR_FILES', {
+        taskId,
+        downloadUrl: command.download_url
+      });
+    }
+  }
+  
   return null;
 }
 
@@ -1127,7 +1162,7 @@ async function handleAssistantOutput(tabId, payload) {
     if (sourceAgent?.type === 'PM') {
       validationError = validatePmCommand(state, command);
     } else {
-      validationError = validateAgentResult(state, sourceAgentId, command);
+      validationError = await validateAgentResult(state, sourceAgentId, command);
     }
 
     if (validationError) {
@@ -1471,6 +1506,69 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           maxMB: (MAX_TOTAL_STORAGE_BYTES / 1024 / 1024).toFixed(2),
           percentUsed: ((totalSize / MAX_TOTAL_STORAGE_BYTES) * 100).toFixed(1)
         });
+        return;
+      }
+
+      // P0 Guard Rail: Auto-download files from sidecar
+      case 'AUTOMATOR_DOWNLOAD_FILE': {
+        const { fileId } = message;
+        if (!fileId) {
+          throw new Error('fileId is required');
+        }
+        
+        const fileData = await getFileData(fileId);
+        if (!fileData) {
+          throw new Error(`File not found: ${fileId}`);
+        }
+        
+        try {
+          await chrome.downloads.download({
+            url: fileData.dataUrl,
+            filename: fileData.fileName,
+            saveAs: false
+          });
+          
+          logEvent(await loadState(), 'FILE_AUTO_DOWNLOADED', {
+            fileId,
+            fileName: fileData.fileName,
+            taskId: fileData.taskId
+          });
+          
+          sendResponse({ ok: true, fileId, fileName: fileData.fileName });
+        } catch (downloadError) {
+          logEvent(await loadState(), 'FILE_DOWNLOAD_FAILED', {
+            fileId,
+            error: String(downloadError.message || downloadError)
+          });
+          throw downloadError;
+        }
+        return;
+      }
+
+      // P0 Guard Rail: Auto-download multiple files for a task
+      case 'AUTOMATOR_DOWNLOAD_TASK_FILES': {
+        const { taskId } = message;
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        
+        const files = await getFilesForTask(taskId);
+        const results = [];
+        
+        for (const file of files) {
+          try {
+            await chrome.downloads.download({
+              url: file.dataUrl,
+              filename: file.fileName,
+              saveAs: false
+            });
+            results.push({ ok: true, fileId: file.fileId, fileName: file.fileName });
+          } catch (error) {
+            results.push({ ok: false, fileId: file.fileId, error: error.message });
+          }
+        }
+        
+        sendResponse({ ok: true, taskId, results });
         return;
       }
 
