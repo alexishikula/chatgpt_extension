@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Automator V1</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Automator</h1>
+      <div class="sub">V1 · tab-based prototype</div>
+    </div>
+    <button id="pauseButton" class="danger">Pause</button>
+  </header>
+
+  <section class="status-strip">
+    <span>System</span>
+    <strong id="systemStatus">Loading…</strong>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Agents</h2>
+      <button id="refreshButton" class="secondary">Reconcile</button>
+    </div>
+    <p class="hint">Create an agent, describe it, and assign one open ChatGPT conversation to it. Automator remembers the conversation even if Chrome later gives the tab a different ID.</p>
+
+    <div class="agent-form">
+      <label>
+        Type
+        <select id="agentType">
+          <option value="SPECIALIST">Specialist agent</option>
+          <option value="PM">Project Manager</option>
+        </select>
+      </label>
+      <label>
+        Name
+        <input id="agentName" placeholder="Firmware Engineer" autocomplete="off" />
+      </label>
+      <label>
+        Agent ID
+        <input id="agentId" placeholder="firmware_engineer" autocomplete="off" />
+      </label>
+      <label>
+        Description
+        <textarea id="agentDescription" rows="2" placeholder="Handles major firmware implementation."></textarea>
+      </label>
+      <label>
+        ChatGPT conversation
+        <select id="tabSelect"></select>
+      </label>
+      <div class="form-actions">
+        <button id="saveAgentButton">Create agent</button>
+        <button id="cancelEditButton" class="secondary hidden">Cancel edit</button>
+        <button id="refreshTabsButton" class="secondary">Refresh tabs</button>
+      </div>
+    </div>
+
+    <div id="agents"></div>
+  </section>
+
+  <section>
+    <h2>Owner gates</h2>
+    <div id="gates" class="empty">No active gates.</div>
+  </section>
+
+  <section>
+    <h2>Tasks</h2>
+    <div id="tasks" class="empty">No tasks yet.</div>
+  </section>
+
+  <section>
+    <h2>Recent activity</h2>
+    <div id="events" class="event-list"></div>
+  </section>
+
+  <details>
+    <summary>JSON protocol examples</summary>
+    <p class="hint">PM routes downward by specifying <code>target_agent_id</code>.</p>
+    <pre>&lt;&lt;AUTOMATOR&gt;&gt;
+{
+  "action": "DISPATCH_TASK",
+  "task_id": "TEST-001",
+  "target_agent_id": "qa_reviewer",
+  "assignment": "Review the work and report your result."
+}
+&lt;&lt;END_AUTOMATOR&gt;&gt;</pre>
+    <p class="hint">Agents never specify a destination. Automator returns the result to the PM stored on the task.</p>
+    <pre>&lt;&lt;AUTOMATOR&gt;&gt;
+{
+  "action": "TASK_RESULT",
+  "task_id": "TEST-001",
+  "status": "COMPLETE",
+  "summary": "Review completed."
+}
+&lt;&lt;END_AUTOMATOR&gt;&gt;</pre>
+  </details>
+
+  <footer>
+    <button id="clearButton" class="text-button">Reset local Automator data</button>
+    <div id="message" aria-live="polite"></div>
+  </footer>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

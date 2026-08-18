@@ -1,0 +1,830 @@
+const STORAGE_KEY = 'automatorStateV1';
+const RECONCILE_ALARM = 'automator-reconcile';
+const CHATGPT_URL_RE = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//i;
+const ACTIVE_TASK_STATES = new Set(['DISPATCHING', 'RUNNING', 'RESPONSE_NO_VALID_RESULT']);
+const TERMINAL_TASK_STATES = new Set(['COMPLETED', 'CANCELLED']);
+const AGENT_RESULT_STATUSES = new Set([
+  'COMPLETE',
+  'FAILED',
+  'ESCALATION_REQUIRED',
+  'OWNER_ACTION_REQUIRED'
+]);
+
+let stateMutationQueue = Promise.resolve();
+
+const DEFAULT_STATE = {
+  version: 2,
+  paused: false,
+  agents: {},
+  tasks: {},
+  ownerGates: {},
+  eventLog: [],
+  lastSeenByAgent: {},
+  lastProcessedByAgent: {},
+  settings: {
+    autoRoute: true,
+    reconcilePeriodMinutes: 1
+  }
+};
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function normalizeConversationUrl(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    if (!CHATGPT_URL_RE.test(parsed.href)) return null;
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.href.replace(/\/$/, '');
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeAgentId(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+}
+
+function normalizeState(raw) {
+  const state = { ...structuredClone(DEFAULT_STATE), ...(raw || {}) };
+  state.settings = { ...DEFAULT_STATE.settings, ...(raw?.settings || {}) };
+  state.agents ||= {};
+  state.tasks ||= {};
+  state.ownerGates ||= {};
+  state.eventLog ||= [];
+  state.lastSeenByAgent ||= {};
+  state.lastProcessedByAgent ||= {};
+
+  // One-time migration from the original fixed-role prototype.
+  if ((raw?.version || 1) < 2) {
+    const migratedAgents = {};
+    for (const [legacyRole, agent] of Object.entries(raw?.agents || {})) {
+      const isPm = String(legacyRole).toUpperCase() === 'PM';
+      const id = isPm ? 'pm' : normalizeAgentId(legacyRole);
+      if (!id) continue;
+      migratedAgents[id] = {
+        id,
+        name: isPm ? 'Project Manager' : (agent.title || legacyRole),
+        description: '',
+        type: isPm ? 'PM' : 'SPECIALIST',
+        tabId: agent.tabId || null,
+        conversationUrl: normalizeConversationUrl(agent.url),
+        title: agent.title || '',
+        status: agent.tabId ? 'CONNECTED' : 'MISSING',
+        createdAt: agent.registeredAt || nowIso(),
+        updatedAt: nowIso()
+      };
+    }
+    state.agents = migratedAgents;
+    state.tasks = {};
+    state.ownerGates = {};
+    state.lastSeenByAgent = {};
+    state.lastProcessedByAgent = {};
+    state.version = 2;
+  }
+
+  return state;
+}
+
+async function loadState() {
+  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  return normalizeState(stored[STORAGE_KEY]);
+}
+
+async function saveState(state) {
+  state.version = 2;
+  await chrome.storage.local.set({ [STORAGE_KEY]: state });
+}
+
+function logEvent(state, type, details = {}) {
+  state.eventLog.unshift({
+    id: crypto.randomUUID(),
+    at: nowIso(),
+    type,
+    details
+  });
+  state.eventLog = state.eventLog.slice(0, 300);
+}
+
+async function mutateState(mutator) {
+  const operation = stateMutationQueue.then(async () => {
+    const state = await loadState();
+    await mutator(state);
+    await saveState(state);
+    return state;
+  });
+  stateMutationQueue = operation.catch(() => {});
+  return operation;
+}
+
+async function sendToTab(tabId, message) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (firstError) {
+    // Tabs that were already open when the extension was installed may not yet
+    // have the declared content script. Inject the adapter once and retry.
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content.js']
+      });
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (secondError) {
+      return {
+        ok: false,
+        error: String(secondError?.message || firstError?.message || secondError || firstError)
+      };
+    }
+  }
+}
+
+function agentIdForTab(state, tabId) {
+  return Object.entries(state.agents).find(([, agent]) => agent.tabId === tabId)?.[0] || null;
+}
+
+function getPmAgent(state) {
+  return Object.values(state.agents).find((agent) => agent.type === 'PM') || null;
+}
+
+function getActiveTaskForAgent(state, agentId) {
+  return Object.values(state.tasks).find(
+    (task) => task.assignedToAgentId === agentId && ACTIVE_TASK_STATES.has(task.status)
+  ) || null;
+}
+
+function parseProtocol(text) {
+  if (!text) return { found: false, command: null, error: null };
+  const patterns = [
+    /<<AUTOMATOR>>\s*([\s\S]*?)\s*<<END_AUTOMATOR>>/m,
+    /<AUTOMATOR>\s*([\s\S]*?)\s*<\/AUTOMATOR>/m,
+    /```automator\s*([\s\S]*?)\s*```/mi
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    try {
+      return { found: true, command: JSON.parse(match[1]), error: null, raw: match[1] };
+    } catch (error) {
+      return {
+        found: true,
+        command: null,
+        error: `Invalid JSON: ${String(error.message || error)}`,
+        raw: match[1]
+      };
+    }
+  }
+  return { found: false, command: null, error: null };
+}
+
+function validatePmCommand(state, command) {
+  if (!command || typeof command !== 'object' || Array.isArray(command)) return 'Command must be a JSON object.';
+  const allowed = new Set([
+    'DISPATCH_TASK',
+    'REQUEST_OWNER_APPROVAL',
+    'REQUEST_OWNER_ACTION',
+    'COMPLETE_TASK',
+    'CANCEL_TASK',
+    'PAUSE_PROJECT',
+    'COMPLETE_PROJECT'
+  ]);
+  if (!allowed.has(command.action)) return `Unsupported PM action: ${command.action}`;
+
+  if (command.action === 'DISPATCH_TASK') {
+    const taskId = String(command.task_id || '').trim();
+    const targetAgentId = normalizeAgentId(command.target_agent_id);
+    if (!taskId) return 'DISPATCH_TASK requires task_id.';
+    if (!targetAgentId) return 'DISPATCH_TASK requires target_agent_id.';
+    if (Object.prototype.hasOwnProperty.call(state.tasks, taskId)) return `task_id ${taskId} already exists and cannot be reused.`;
+    const target = state.agents[targetAgentId];
+    if (!target) return `Unknown target_agent_id: ${targetAgentId}`;
+    if (target.type === 'PM') return 'PM cannot dispatch a task to itself.';
+    if (getActiveTaskForAgent(state, targetAgentId)) {
+      return `${targetAgentId} already has an active assignment.`;
+    }
+    if (command.assignment === undefined || command.assignment === null || command.assignment === '') {
+      return 'DISPATCH_TASK requires assignment.';
+    }
+  }
+
+  if (['COMPLETE_TASK', 'CANCEL_TASK'].includes(command.action)) {
+    const taskId = String(command.task_id || '').trim();
+    if (!taskId) return `${command.action} requires task_id.`;
+    if (!state.tasks[taskId]) return `Unknown task_id: ${taskId}`;
+  }
+
+  if (['REQUEST_OWNER_APPROVAL', 'REQUEST_OWNER_ACTION'].includes(command.action)) {
+    if (!String(command.gate_id || '').trim()) return `${command.action} requires gate_id.`;
+    if (!String(command.reason || '').trim()) return `${command.action} requires reason.`;
+    if (!String(command.instructions || '').trim()) return `${command.action} requires instructions.`;
+    if (state.ownerGates[String(command.gate_id)]) return `gate_id ${command.gate_id} already exists.`;
+  }
+
+  return null;
+}
+
+function validateAgentResult(state, sourceAgentId, command) {
+  if (!command || typeof command !== 'object' || Array.isArray(command)) return 'Result must be a JSON object.';
+  if (command.action !== 'TASK_RESULT') return `Agents may only return action TASK_RESULT, not ${command.action || '(missing)'}.`;
+  const taskId = String(command.task_id || '').trim();
+  if (!taskId) return 'TASK_RESULT requires task_id.';
+  const task = state.tasks[taskId];
+  if (!task) return `Unknown task_id: ${taskId}`;
+  if (task.assignedToAgentId !== sourceAgentId) {
+    return `Task ${taskId} is assigned to ${task.assignedToAgentId}, not ${sourceAgentId}.`;
+  }
+  if (!AGENT_RESULT_STATUSES.has(String(command.status || ''))) {
+    return `Unsupported TASK_RESULT status: ${command.status || '(missing)'}.`;
+  }
+  if (TERMINAL_TASK_STATES.has(task.status)) return `Task ${taskId} is already ${task.status}.`;
+  return null;
+}
+
+async function listChatGptTabs() {
+  const tabs = await chrome.tabs.query({});
+  return tabs
+    .filter((tab) => tab.id && CHATGPT_URL_RE.test(tab.url || ''))
+    .map((tab) => ({
+      id: tab.id,
+      windowId: tab.windowId,
+      active: Boolean(tab.active),
+      title: tab.title || 'ChatGPT',
+      url: tab.url || '',
+      conversationUrl: normalizeConversationUrl(tab.url)
+    }));
+}
+
+async function resolveTabForAgent(state, agentId) {
+  const agent = state.agents[agentId];
+  if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+
+  if (agent.tabId) {
+    const tab = await chrome.tabs.get(agent.tabId).catch(() => null);
+    if (tab && normalizeConversationUrl(tab.url) === agent.conversationUrl) {
+      agent.status = 'CONNECTED';
+      agent.title = tab.title || agent.title;
+      return tab;
+    }
+  }
+
+  if (agent.conversationUrl) {
+    const tabs = await listChatGptTabs();
+    const match = tabs.find((tab) => tab.conversationUrl === agent.conversationUrl);
+    if (match) {
+      agent.tabId = match.id;
+      agent.title = match.title;
+      agent.status = 'CONNECTED';
+      agent.updatedAt = nowIso();
+      return await chrome.tabs.get(match.id);
+    }
+  }
+
+  agent.tabId = null;
+  agent.status = 'MISSING';
+  throw new Error(`${agent.name || agentId} has no connected ChatGPT tab.`);
+}
+
+async function dispatchMessageToAgent(state, agentId, text, taskId = null) {
+  const targetId = normalizeAgentId(agentId);
+  const tab = await resolveTabForAgent(state, targetId);
+  const response = await sendToTab(tab.id, {
+    type: 'AUTOMATOR_SEND_MESSAGE',
+    text,
+    taskId
+  });
+  if (!response?.ok) throw new Error(response?.error || `Could not send to ${targetId}`);
+  return response;
+}
+
+function buildAgentAssignment(task, targetAgent) {
+  const assignmentText = typeof task.assignment === 'string'
+    ? task.assignment
+    : JSON.stringify(task.assignment, null, 2);
+
+  return [
+    'AUTOMATOR ASSIGNMENT',
+    `TASK_ID: ${task.id}`,
+    `FROM: ${task.createdByAgentId}`,
+    `YOUR_AGENT_ID: ${targetAgent.id}`,
+    '',
+    'ASSIGNMENT:',
+    assignmentText,
+    '',
+    'When this assignment is finished, return exactly one <<AUTOMATOR>> JSON block using action TASK_RESULT and this same TASK_ID.'
+  ].join('\n');
+}
+
+function buildPmResultEnvelope(sourceAgent, task, command, rawText) {
+  return [
+    'AUTOMATOR AGENT RETURN',
+    `SOURCE_AGENT_ID: ${sourceAgent.id}`,
+    `SOURCE_AGENT_NAME: ${sourceAgent.name}`,
+    `TASK_ID: ${task.id}`,
+    `AGENT_STATUS: ${command.status}`,
+    '',
+    'FULL AGENT RESPONSE:',
+    rawText
+  ].join('\n');
+}
+
+function buildOwnerGateEnvelope(gate) {
+  return [
+    'AUTOMATOR OWNER GATE RESPONSE',
+    `GATE_ID: ${gate.id}`,
+    `TASK_ID: ${gate.taskId || 'NONE'}`,
+    `RESULT: ${gate.resolution}`,
+    `COMMENT: ${gate.comment || '(none)'}`,
+    '',
+    'Evaluate this owner response and decide the next project action.'
+  ].join('\n');
+}
+
+function buildValidationCorrection(error, sourceType, activeTaskId = null) {
+  const lines = [
+    'AUTOMATOR VALIDATION ERROR',
+    `Your last machine-readable output was rejected: ${error}`,
+    '',
+    'Return a corrected response with exactly one block:',
+    '<<AUTOMATOR>>',
+    '{ valid JSON }',
+    '<<END_AUTOMATOR>>',
+    '',
+    'Do not invent a different action or identifier merely to bypass the error.'
+  ];
+  if (sourceType === 'SPECIALIST' && activeTaskId) {
+    lines.push(`Keep TASK_ID exactly: ${activeTaskId}`);
+    lines.push('Agents must use action TASK_RESULT.');
+  }
+  return lines.join('\n');
+}
+
+async function sendValidationCorrection(state, sourceAgentId, error) {
+  const source = state.agents[sourceAgentId];
+  if (!source) return;
+  const activeTask = source.type === 'PM' ? null : getActiveTaskForAgent(state, sourceAgentId);
+  try {
+    await dispatchMessageToAgent(
+      state,
+      sourceAgentId,
+      buildValidationCorrection(error, source.type, activeTask?.id || null),
+      activeTask?.id || null
+    );
+    logEvent(state, 'VALIDATION_CORRECTION_SENT', { sourceAgentId, error });
+  } catch (sendError) {
+    logEvent(state, 'VALIDATION_CORRECTION_FAILED', {
+      sourceAgentId,
+      error: String(sendError.message || sendError)
+    });
+  }
+}
+
+async function executePmCommand(state, sourceAgentId, command) {
+  switch (command.action) {
+    case 'DISPATCH_TASK': {
+      const taskId = String(command.task_id).trim();
+      const targetAgentId = normalizeAgentId(command.target_agent_id);
+      const targetAgent = state.agents[targetAgentId];
+      const task = {
+        id: taskId,
+        createdByAgentId: sourceAgentId,
+        assignedToAgentId: targetAgentId,
+        returnToAgentId: sourceAgentId,
+        status: 'DISPATCHING',
+        agentStatus: null,
+        assignment: command.assignment,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        attempts: 1
+      };
+      state.tasks[taskId] = task;
+      logEvent(state, 'TASK_CREATED', { taskId, targetAgentId, returnToAgentId: sourceAgentId });
+
+      try {
+        await dispatchMessageToAgent(state, targetAgentId, buildAgentAssignment(task, targetAgent), taskId);
+        task.status = 'RUNNING';
+        task.updatedAt = nowIso();
+        logEvent(state, 'TASK_DISPATCHED', { taskId, targetAgentId });
+      } catch (error) {
+        task.status = 'FAILED';
+        task.error = String(error.message || error);
+        task.updatedAt = nowIso();
+        logEvent(state, 'TASK_DISPATCH_FAILED', { taskId, targetAgentId, error: task.error });
+      }
+      return;
+    }
+
+    case 'REQUEST_OWNER_APPROVAL':
+    case 'REQUEST_OWNER_ACTION': {
+      const gateId = String(command.gate_id).trim();
+      const taskId = command.task_id ? String(command.task_id).trim() : null;
+      state.ownerGates[gateId] = {
+        id: gateId,
+        type: command.action,
+        status: 'WAITING_FOR_OWNER',
+        reason: String(command.reason || ''),
+        instructions: String(command.instructions || ''),
+        taskId,
+        createdByAgentId: sourceAgentId,
+        createdAt: nowIso()
+      };
+      if (taskId && state.tasks[taskId]) {
+        state.tasks[taskId].status = 'WAITING_FOR_OWNER';
+        state.tasks[taskId].updatedAt = nowIso();
+      }
+      logEvent(state, 'OWNER_GATE_CREATED', { gateId, taskId, type: command.action });
+      return;
+    }
+
+    case 'COMPLETE_TASK': {
+      const taskId = String(command.task_id).trim();
+      state.tasks[taskId].status = 'COMPLETED';
+      state.tasks[taskId].updatedAt = nowIso();
+      logEvent(state, 'TASK_COMPLETED', { taskId });
+      return;
+    }
+
+    case 'CANCEL_TASK': {
+      const taskId = String(command.task_id).trim();
+      state.tasks[taskId].status = 'CANCELLED';
+      state.tasks[taskId].updatedAt = nowIso();
+      logEvent(state, 'TASK_CANCELLED', { taskId });
+      return;
+    }
+
+    case 'PAUSE_PROJECT':
+      state.paused = true;
+      logEvent(state, 'GLOBAL_PAUSE_BY_PM', {});
+      return;
+
+    case 'COMPLETE_PROJECT':
+      logEvent(state, 'PROJECT_COMPLETION_RECORDED', { note: command.summary || '' });
+      return;
+  }
+}
+
+async function executeAgentResult(state, sourceAgentId, command, rawText) {
+  const task = state.tasks[String(command.task_id).trim()];
+  const sourceAgent = state.agents[sourceAgentId];
+  task.agentStatus = command.status;
+  task.resultSummary = command.summary || '';
+  task.fullResult = rawText;
+  task.status = 'RESULT_RECEIVED';
+  task.updatedAt = nowIso();
+  logEvent(state, 'TASK_RESULT_RECEIVED', { taskId: task.id, sourceAgentId, agentStatus: command.status });
+
+  try {
+    await dispatchMessageToAgent(
+      state,
+      task.returnToAgentId,
+      buildPmResultEnvelope(sourceAgent, task, command, rawText),
+      task.id
+    );
+    task.status = 'PM_REVIEW';
+    task.returnedToPmAt = nowIso();
+    task.updatedAt = nowIso();
+    logEvent(state, 'RESULT_RETURNED_TO_PM', {
+      taskId: task.id,
+      sourceAgentId,
+      returnToAgentId: task.returnToAgentId
+    });
+  } catch (error) {
+    task.status = 'RESULT_RETURN_FAILED';
+    task.error = String(error.message || error);
+    task.updatedAt = nowIso();
+    logEvent(state, 'RESULT_RETURN_TO_PM_FAILED', { taskId: task.id, error: task.error });
+  }
+}
+
+async function handleAssistantOutput(tabId, payload) {
+  if (!tabId || !payload?.text || payload.streaming) return;
+
+  await mutateState(async (state) => {
+    const sourceAgentId = agentIdForTab(state, tabId);
+    if (!sourceAgentId) return;
+
+    const fingerprint = payload.fingerprint || payload.text;
+    state.lastSeenByAgent[sourceAgentId] = fingerprint;
+    if (state.lastProcessedByAgent[sourceAgentId] === fingerprint) return;
+
+    logEvent(state, 'ASSISTANT_OUTPUT_CAPTURED', {
+      sourceAgentId,
+      tabId,
+      chars: payload.text.length
+    });
+
+    // Global pause holds automation without consuming the response.
+    if (state.paused) {
+      logEvent(state, 'OUTPUT_HELD_GLOBAL_PAUSE', { sourceAgentId });
+      return;
+    }
+
+    const sourceAgent = state.agents[sourceAgentId];
+    const parsed = parseProtocol(payload.text);
+
+    if (!parsed.found) {
+      if (sourceAgent?.type !== 'PM') {
+        const activeTask = getActiveTaskForAgent(state, sourceAgentId);
+        if (activeTask) {
+          activeTask.status = 'RESPONSE_NO_VALID_RESULT';
+          activeTask.updatedAt = nowIso();
+          logEvent(state, 'AGENT_RESPONSE_NO_PROTOCOL', { sourceAgentId, taskId: activeTask.id });
+        }
+      }
+      state.lastProcessedByAgent[sourceAgentId] = fingerprint;
+      return;
+    }
+
+    if (parsed.error) {
+      await sendValidationCorrection(state, sourceAgentId, parsed.error);
+      state.lastProcessedByAgent[sourceAgentId] = fingerprint;
+      return;
+    }
+
+    const command = parsed.command;
+    let validationError;
+    if (sourceAgent?.type === 'PM') {
+      validationError = validatePmCommand(state, command);
+    } else {
+      validationError = validateAgentResult(state, sourceAgentId, command);
+    }
+
+    if (validationError) {
+      logEvent(state, 'INVALID_COMMAND', { sourceAgentId, error: validationError, command });
+      await sendValidationCorrection(state, sourceAgentId, validationError);
+      state.lastProcessedByAgent[sourceAgentId] = fingerprint;
+      return;
+    }
+
+    if (sourceAgent?.type === 'PM') {
+      await executePmCommand(state, sourceAgentId, command);
+    } else {
+      await executeAgentResult(state, sourceAgentId, command, payload.text);
+    }
+
+    state.lastProcessedByAgent[sourceAgentId] = fingerprint;
+  });
+}
+
+async function reconcileAgentTabs() {
+  const openTabs = await listChatGptTabs();
+  await mutateState(async (state) => {
+    for (const [agentId, agent] of Object.entries(state.agents)) {
+      let match = null;
+      if (agent.tabId) {
+        match = openTabs.find(
+          (tab) => tab.id === agent.tabId && tab.conversationUrl === agent.conversationUrl
+        ) || null;
+      }
+      if (!match && agent.conversationUrl) {
+        match = openTabs.find((tab) => tab.conversationUrl === agent.conversationUrl) || null;
+      }
+
+      if (match) {
+        const changed = agent.tabId !== match.id || agent.status !== 'CONNECTED';
+        agent.tabId = match.id;
+        agent.title = match.title;
+        agent.status = 'CONNECTED';
+        agent.updatedAt = nowIso();
+        if (changed) logEvent(state, 'AGENT_RECONNECTED', { agentId, tabId: match.id });
+      } else if (agent.tabId || agent.status !== 'MISSING') {
+        agent.tabId = null;
+        agent.status = 'MISSING';
+        agent.updatedAt = nowIso();
+        logEvent(state, 'AGENT_TAB_MISSING', { agentId });
+      }
+    }
+  });
+}
+
+async function reconcile() {
+  await reconcileAgentTabs();
+  const state = await loadState();
+  for (const agent of Object.values(state.agents)) {
+    if (!agent.tabId) continue;
+    const response = await sendToTab(agent.tabId, { type: 'AUTOMATOR_GET_LAST_ASSISTANT' });
+    if (response?.ok && response.message) {
+      await handleAssistantOutput(agent.tabId, response.message);
+    }
+  }
+}
+
+async function ensureReconcileAlarm() {
+  const alarm = await chrome.alarms.get(RECONCILE_ALARM).catch(() => null);
+  if (!alarm) {
+    await chrome.alarms.create(RECONCILE_ALARM, { periodInMinutes: 1 });
+  }
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
+  const current = await chrome.storage.local.get(STORAGE_KEY);
+  await saveState(normalizeState(current[STORAGE_KEY]));
+  await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  await ensureReconcileAlarm();
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await ensureReconcileAlarm();
+  await reconcile();
+});
+
+// Service workers are ephemeral. Check the recovery alarm whenever this worker starts.
+ensureReconcileAlarm().catch(() => {});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === RECONCILE_ALARM) reconcile();
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await mutateState(async (state) => {
+    const agentId = agentIdForTab(state, tabId);
+    if (!agentId) return;
+    state.agents[agentId].tabId = null;
+    state.agents[agentId].status = 'MISSING';
+    state.agents[agentId].updatedAt = nowIso();
+    logEvent(state, 'REGISTERED_TAB_CLOSED', { agentId, tabId });
+  });
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  (async () => {
+    switch (message?.type) {
+      case 'AUTOMATOR_ASSISTANT_OUTPUT':
+        await handleAssistantOutput(sender.tab?.id, message.payload);
+        sendResponse({ ok: true });
+        return;
+
+      case 'AUTOMATOR_GET_STATE':
+        sendResponse({ ok: true, state: await loadState() });
+        return;
+
+      case 'AUTOMATOR_LIST_CHATGPT_TABS':
+        sendResponse({ ok: true, tabs: await listChatGptTabs() });
+        return;
+
+      case 'AUTOMATOR_UPSERT_AGENT': {
+        const name = String(message.agent?.name || '').trim();
+        const description = String(message.agent?.description || '').trim();
+        const type = message.agent?.type === 'PM' ? 'PM' : 'SPECIALIST';
+        const isEdit = Boolean(message.agent?.isEdit);
+        let agentId = type === 'PM' ? 'pm' : normalizeAgentId(message.agent?.id || name);
+        const tabId = Number(message.agent?.tabId);
+        if (!name) throw new Error('Agent name is required.');
+        if (!agentId) throw new Error('Agent ID is required.');
+        if (!Number.isInteger(tabId)) throw new Error('Choose a ChatGPT tab for this agent.');
+
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab || !CHATGPT_URL_RE.test(tab.url || '')) throw new Error('Selected tab is not a ChatGPT tab.');
+        const conversationUrl = normalizeConversationUrl(tab.url);
+        if (!conversationUrl) throw new Error('Could not identify the ChatGPT conversation URL.');
+        const conversationPath = new URL(conversationUrl).pathname;
+        if (!conversationPath || conversationPath === '/') {
+          throw new Error('Open an actual ChatGPT conversation first (send at least one message), then assign that conversation.');
+        }
+        if (type !== 'PM' && agentId === 'pm') throw new Error('The agent ID pm is reserved for the Project Manager.');
+
+        const state = await mutateState(async (draft) => {
+          const existing = draft.agents[agentId];
+          if (existing && !isEdit) throw new Error(`Agent ID ${agentId} already exists. Use Edit instead.`);
+          if (!existing && isEdit) throw new Error('The agent being edited no longer exists.');
+          if (existing && existing.type !== type) throw new Error('Agent type cannot be changed after creation. Remove and recreate the agent instead.');
+          if (type === 'PM') {
+            const existingPm = getPmAgent(draft);
+            if (existingPm && existingPm.id !== agentId) throw new Error('Only one PM is allowed in V1.');
+          }
+
+          for (const [otherId, other] of Object.entries(draft.agents)) {
+            if (otherId !== agentId && other.conversationUrl === conversationUrl) {
+              throw new Error(`That ChatGPT conversation is already assigned to ${other.name}.`);
+            }
+          }
+
+          draft.agents[agentId] = {
+            id: agentId,
+            name,
+            description,
+            type,
+            tabId,
+            conversationUrl,
+            title: tab.title || name,
+            status: 'CONNECTED',
+            createdAt: existing?.createdAt || nowIso(),
+            updatedAt: nowIso()
+          };
+          logEvent(draft, existing ? 'AGENT_UPDATED' : 'AGENT_CREATED', { agentId, tabId, type });
+        });
+        sendResponse({ ok: true, state });
+        return;
+      }
+
+      case 'AUTOMATOR_REMOVE_AGENT': {
+        const agentId = normalizeAgentId(message.agentId);
+        const state = await mutateState(async (draft) => {
+          if (!draft.agents[agentId]) throw new Error('Agent not found.');
+          const activeTask = getActiveTaskForAgent(draft, agentId);
+          if (activeTask) throw new Error(`Cannot remove ${agentId} while ${activeTask.id} is active.`);
+          if (draft.agents[agentId].type === 'PM') {
+            const hasOpenWorkflow = Object.values(draft.tasks).some((task) => !TERMINAL_TASK_STATES.has(task.status));
+            const hasOpenGate = Object.values(draft.ownerGates).some((gate) => gate.status === 'WAITING_FOR_OWNER');
+            if (hasOpenWorkflow || hasOpenGate) throw new Error('Cannot remove PM while workflows or owner gates are open.');
+          }
+          delete draft.agents[agentId];
+          delete draft.lastSeenByAgent[agentId];
+          delete draft.lastProcessedByAgent[agentId];
+          logEvent(draft, 'AGENT_REMOVED', { agentId });
+        });
+        sendResponse({ ok: true, state });
+        return;
+      }
+
+      case 'AUTOMATOR_SET_PAUSED': {
+        const state = await mutateState(async (draft) => {
+          draft.paused = Boolean(message.paused);
+          logEvent(draft, draft.paused ? 'GLOBAL_PAUSED' : 'GLOBAL_RESUMED', { source: 'OWNER_UI' });
+        });
+        if (!state.paused) await reconcile();
+        sendResponse({ ok: true, state: await loadState() });
+        return;
+      }
+
+      case 'AUTOMATOR_RESOLVE_GATE': {
+        const state = await mutateState(async (draft) => {
+          const gate = draft.ownerGates[message.gateId];
+          if (!gate) throw new Error('Gate not found.');
+          if (gate.status !== 'WAITING_FOR_OWNER') throw new Error('Gate is already resolved.');
+          gate.status = 'RESOLVED';
+          gate.resolution = String(message.resolution || '').toUpperCase();
+          gate.comment = String(message.comment || '');
+          gate.resolvedAt = nowIso();
+          logEvent(draft, 'OWNER_GATE_RESOLVED', { gateId: gate.id, resolution: gate.resolution });
+
+          const pm = getPmAgent(draft);
+          if (!pm) throw new Error('PM is not configured.');
+          try {
+            await dispatchMessageToAgent(draft, pm.id, buildOwnerGateEnvelope(gate), gate.taskId);
+            logEvent(draft, 'OWNER_GATE_RETURNED_TO_PM', { gateId: gate.id });
+          } catch (error) {
+            gate.returnError = String(error.message || error);
+            logEvent(draft, 'OWNER_GATE_RETURN_FAILED', { gateId: gate.id, error: gate.returnError });
+          }
+        });
+        sendResponse({ ok: true, state });
+        return;
+      }
+
+      case 'AUTOMATOR_RECONCILE_NOW':
+        await reconcile();
+        sendResponse({ ok: true, state: await loadState() });
+        return;
+
+      case 'AUTOMATOR_OPEN_AGENT': {
+        const state = await loadState();
+        const agentId = normalizeAgentId(message.agentId);
+        const agent = state.agents[agentId];
+        if (!agent) throw new Error('Agent not found.');
+
+        let tab = null;
+        if (agent.tabId) {
+          tab = await chrome.tabs.get(agent.tabId).catch(() => null);
+          if (tab && normalizeConversationUrl(tab.url) !== agent.conversationUrl) tab = null;
+        }
+        if (!tab && agent.conversationUrl) {
+          const openTabs = await listChatGptTabs();
+          const match = openTabs.find((item) => item.conversationUrl === agent.conversationUrl);
+          if (match) tab = await chrome.tabs.get(match.id);
+        }
+        if (!tab && agent.conversationUrl) {
+          tab = await chrome.tabs.create({ url: agent.conversationUrl, active: true });
+        }
+        if (!tab) throw new Error('No saved conversation URL for this agent.');
+
+        await chrome.tabs.update(tab.id, { active: true });
+        if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+        await mutateState(async (draft) => {
+          if (!draft.agents[agentId]) return;
+          draft.agents[agentId].tabId = tab.id;
+          draft.agents[agentId].status = 'CONNECTED';
+          draft.agents[agentId].title = tab.title || draft.agents[agentId].title;
+          draft.agents[agentId].updatedAt = nowIso();
+          logEvent(draft, 'AGENT_OPENED', { agentId, tabId: tab.id });
+        });
+        sendResponse({ ok: true, state: await loadState() });
+        return;
+      }
+
+      case 'AUTOMATOR_CLEAR_DATA':
+        await saveState(structuredClone(DEFAULT_STATE));
+        sendResponse({ ok: true, state: await loadState() });
+        return;
+
+      default:
+        sendResponse({ ok: false, error: 'Unknown message type' });
+    }
+  })().catch((error) => sendResponse({ ok: false, error: String(error.message || error) }));
+  return true;
+});
