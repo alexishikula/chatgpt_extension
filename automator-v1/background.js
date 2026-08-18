@@ -722,22 +722,35 @@ async function dispatchMessageToAgent(state, agentId, text, taskId = null) {
   return response;
 }
 
-function buildAgentAssignment(task, targetAgent) {
+function buildAgentAssignment(task, targetAgent, attachedFiles = []) {
   const assignmentText = typeof task.assignment === 'string'
     ? task.assignment
     : JSON.stringify(task.assignment, null, 2);
+  
+  const hasFiles = attachedFiles && attachedFiles.length > 0;
+  const fileSection = hasFiles
+    ? [
+        '',
+        'ATTACHED FILES FROM PREVIOUS AGENTS:',
+        ...attachedFiles.map(f => `- ${f.fileName} (fileId: ${f.fileId}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`),
+        '',
+        'Use sidecar.getFileData(fileId) to retrieve each file.'
+      ].join('\n')
+    : '';
 
   return [
     'AUTOMATOR ASSIGNMENT',
     `TASK_ID: ${task.id}`,
     `FROM: ${task.createdByAgentId}`,
     `YOUR_AGENT_ID: ${targetAgent.id}`,
+    hasFiles ? `ATTACHED_FILE_COUNT: ${attachedFiles.length}` : '',
+    ...fileSection ? [fileSection] : [],
     '',
     'ASSIGNMENT:',
     assignmentText,
     '',
     'When this assignment is finished, return exactly one <<AUTOMATOR>> JSON block using action TASK_RESULT and this same TASK_ID.'
-  ].join('\n');
+  ].filter(line => line !== '').join('\n');
 }
 
 function buildPmResultEnvelope(sourceAgent, task, command, rawText, files = []) {
@@ -776,6 +789,32 @@ function buildOwnerGateEnvelope(gate) {
     '',
     'Evaluate this owner response and decide the next project action.'
   ].join('\n');
+}
+
+function getFileTypeFromName(fileName) {
+  const ext = fileName.split('.').pop().toLowerCase();
+  const mimeTypes = {
+    'zip': 'application/zip',
+    'tar': 'application/x-tar',
+    'gz': 'application/gzip',
+    'md': 'text/markdown',
+    'txt': 'text/plain',
+    'json': 'application/json',
+    'js': 'application/javascript',
+    'py': 'text/x-python',
+    'java': 'text/x-java',
+    'kt': 'text/x-kotlin',
+    'xml': 'application/xml',
+    'yaml': 'text/yaml',
+    'yml': 'text/yaml',
+    'apk': 'application/vnd.android.package-archive',
+    'pdf': 'application/pdf',
+    'png': 'image/png',
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'gif': 'image/gif'
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
 }
 
 function buildValidationCorrection(error, sourceType, activeTaskId = null) {
@@ -857,6 +896,10 @@ async function executePmCommand(state, sourceAgentId, command) {
       const taskId = String(command.task_id).trim();
       const targetAgentId = normalizeAgentId(command.target_agent_id);
       const targetAgent = state.agents[targetAgentId];
+      
+      // Retrieve any existing files for this task from previous agents
+      const existingFiles = await getFilesForTask(taskId);
+      
       const task = {
         id: taskId,
         createdByAgentId: sourceAgentId,
@@ -865,18 +908,19 @@ async function executePmCommand(state, sourceAgentId, command) {
         status: 'DISPATCHING',
         agentStatus: null,
         assignment: command.assignment,
+        attachedFiles: existingFiles, // Include file metadata in task
         createdAt: nowIso(),
         updatedAt: nowIso(),
         attempts: 1
       };
       state.tasks[taskId] = task;
-      logEvent(state, 'TASK_CREATED', { taskId, targetAgentId, returnToAgentId: sourceAgentId });
+      logEvent(state, 'TASK_CREATED', { taskId, targetAgentId, returnToAgentId: sourceAgentId, fileCount: existingFiles.length });
 
       try {
-        await dispatchMessageToAgent(state, targetAgentId, buildAgentAssignment(task, targetAgent), taskId);
+        await dispatchMessageToAgent(state, targetAgentId, buildAgentAssignment(task, targetAgent, existingFiles), taskId);
         task.status = 'RUNNING';
         task.updatedAt = nowIso();
-        logEvent(state, 'TASK_DISPATCHED', { taskId, targetAgentId });
+        logEvent(state, 'TASK_DISPATCHED', { taskId, targetAgentId, fileCount: existingFiles.length });
       } catch (error) {
         task.status = 'FAILED';
         task.error = String(error.message || error);
@@ -944,8 +988,63 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
   task.status = 'RESULT_RECEIVED';
   task.updatedAt = nowIso();
   
-  // Retrieve any files stored in sidecar for this task
-  const files = await getFilesForTask(task.id);
+  // Check if the command contains deliverables with sandbox paths
+  // If so, we need to request file content from the agent's browser context
+  let files = await getFilesForTask(task.id);
+  const deliverables = command.deliverables || [];
+  
+  // Process any sandbox: paths in deliverables that haven't been stored yet
+  for (const deliv of deliverables) {
+    if (deliv.path && deliv.path.startsWith('sandbox:')) {
+      const existingFileId = `${task.id}:${deliv.name}`;
+      const alreadyStored = files.some(f => f.fileId === existingFileId);
+      
+      if (!alreadyStored) {
+        // Request the agent to read and store this file
+        try {
+          const tabId = sourceAgent.tabId;
+          if (tabId) {
+            const filePath = deliv.path.replace('sandbox:', '');
+            const readResult = await sendToTab(tabId, {
+              type: 'AUTOMATOR_READ_FILE',
+              filePath,
+              fileName: deliv.name,
+              taskId: task.id,
+              sha256: deliv.sha256
+            });
+            
+            if (readResult && readResult.ok && readResult.dataUrl) {
+              // Store the file in sidecar
+              await storeFileForTask(
+                task.id,
+                deliv.name,
+                getFileTypeFromName(deliv.name),
+                readResult.dataUrl,
+                {
+                  uploadedByAgentId: sourceAgentId,
+                  sha256: deliv.sha256,
+                  description: deliv.description || ''
+                }
+              );
+              // Refresh files list
+              files = await getFilesForTask(task.id);
+              logEvent(state, 'FILE_AUTO_EXTRACTED_FROM_SANDBOX', {
+                taskId: task.id,
+                fileName: deliv.name,
+                filePath
+              });
+            }
+          }
+        } catch (readError) {
+          logEvent(state, 'FILE_EXTRACTION_FAILED', {
+            taskId: task.id,
+            fileName: deliv.name,
+            error: String(readError.message || readError)
+          });
+        }
+      }
+    }
+  }
   
   logEvent(state, 'TASK_RESULT_RECEIVED', { 
     taskId: task.id, 
