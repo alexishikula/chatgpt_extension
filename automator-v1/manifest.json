@@ -26,6 +26,7 @@
         "https://chat.openai.com/*"
       ],
       "js": [
+        "src/utils/dom-helper.js",
         "content.js",
         "sidecar-helper.js"
       ],

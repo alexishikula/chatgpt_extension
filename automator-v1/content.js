@@ -2,13 +2,27 @@
   if (window.__AUTOMATOR_V1_02_LOADED__) return;
   window.__AUTOMATOR_V1_02_LOADED__ = true;
 
+  // Import DomHelper utility (available as global in browser context)
+  const DomHelper = window.DomHelper || {};
+  const { queryResilient, waitForElement, waitForClickable, logUiChangeWarning } = DomHelper;
+
   let debounceTimer = null;
   let lastAnnouncedFingerprint = null;
 
-  const assistantSelectors = [
-    '[data-message-author-role="assistant"]',
-    'article [data-message-author-role="assistant"]'
-  ];
+  // Resilient selector strategies for assistant messages
+  const assistantStrategies = {
+    primary: [
+      '[data-message-author-role="assistant"]',
+      'article [data-message-author-role="assistant"]'
+    ],
+    fallback: [
+      'div[role="article"]',
+      '.message-assistant',
+      '[class*="assistant-message"]'
+    ],
+    roleMatch: ['article'],
+    textMatch: []
+  };
 
   function hashString(input) {
     let h = 2166136261;
@@ -20,20 +34,68 @@
   }
 
   function getAssistantNodes() {
-    for (const selector of assistantSelectors) {
-      const nodes = Array.from(document.querySelectorAll(selector));
-      if (nodes.length) return nodes;
+    // Use resilient querying with multiple strategies
+    const nodes = [];
+    
+    // Try primary and fallback selectors
+    const allSelectors = [...assistantStrategies.primary, ...assistantStrategies.fallback];
+    for (const selector of allSelectors) {
+      try {
+        const found = Array.from(document.querySelectorAll(selector));
+        if (found.length) {
+          nodes.push(...found);
+        }
+      } catch (e) {
+        console.warn(`[Content Script] Invalid selector "${selector}":`, e.message);
+      }
     }
-    return [];
+    
+    // If no nodes found, try text/role matching via DomHelper
+    if (nodes.length === 0 && queryResilient) {
+      const element = queryResilient(assistantStrategies, { timeout: 500 });
+      if (element) {
+        nodes.push(element);
+      }
+    }
+    
+    // Log warning if we had to use fallbacks
+    if (nodes.length > 0) {
+      const usedFallback = !assistantStrategies.primary.some(sel => 
+        nodes.some(node => node.matches && node.matches(sel))
+      );
+      if (usedFallback && logUiChangeWarning) {
+        logUiChangeWarning('getAssistantNodes', assistantStrategies.primary, 'Primary selectors may be outdated');
+      }
+    }
+    
+    return nodes;
   }
 
   function isStreaming() {
-    const stopSelectors = [
-      'button[data-testid="stop-button"]',
-      'button[aria-label*="Stop"]',
-      'button[aria-label*="stop"]'
-    ];
-    return stopSelectors.some((selector) => document.querySelector(selector));
+    const stopStrategies = {
+      primary: [
+        'button[data-testid="stop-button"]',
+        'button[aria-label*="Stop"]',
+        'button[aria-label*="stop"]'
+      ],
+      fallback: [
+        '[role="button"][aria-label*="Stop Generating"]',
+        '.stop-generation-btn'
+      ],
+      textMatch: ['Stop generating', 'Stop']
+    };
+
+    // Try immediate query first
+    for (const selector of stopStrategies.primary) {
+      if (document.querySelector(selector)) return true;
+    }
+
+    // Fallback to resilient query
+    if (queryResilient && queryResilient(stopStrategies, { timeout: 200 })) {
+      return true;
+    }
+
+    return false;
   }
 
   function getLastAssistantMessage() {
@@ -53,13 +115,29 @@
   }
 
   function findComposer() {
-    const selectors = [
-      '#prompt-textarea',
-      'textarea[data-testid="prompt-textarea"]',
-      'div[contenteditable="true"][data-testid="prompt-textarea"]',
-      'div.ProseMirror[contenteditable="true"]'
-    ];
-    for (const selector of selectors) {
+    const composerStrategies = {
+      primary: [
+        '#prompt-textarea',
+        'textarea[data-testid="prompt-textarea"]',
+        'div[contenteditable="true"][data-testid="prompt-textarea"]',
+        'div.ProseMirror[contenteditable="true"]'
+      ],
+      fallback: [
+        'textarea[placeholder*="Message"]',
+        'div[contenteditable="true"][role="textbox"]',
+        '[data-id="root-input"]'
+      ],
+      textMatch: ['Send a message', 'Message ChatGPT'],
+      roleMatch: ['textbox']
+    };
+
+    // Try immediate query with all strategies
+    if (queryResilient) {
+      return queryResilient(composerStrategies, { timeout: 300 });
+    }
+
+    // Fallback to original behavior if DomHelper not available
+    for (const selector of composerStrategies.primary) {
       const element = document.querySelector(selector);
       if (element) return element;
     }
@@ -98,13 +176,24 @@
     setComposerText(composer, text);
     await new Promise((resolve) => setTimeout(resolve, 180));
 
-    const sendSelectors = [
-      'button[data-testid="send-button"]',
-      'button[aria-label="Send prompt"]',
-      'button[aria-label*="Send"]'
-    ];
+    const sendStrategies = {
+      primary: [
+        'button[data-testid="send-button"]',
+        'button[aria-label="Send prompt"]',
+        'button[aria-label*="Send"]'
+      ],
+      fallback: [
+        '[role="button"][aria-label*="Send message"]',
+        '.send-message-btn'
+      ],
+      textMatch: ['Send'],
+      roleMatch: ['button']
+    };
+
     let sendButton = null;
-    for (const selector of sendSelectors) {
+    
+    // Try primary selectors first
+    for (const selector of sendStrategies.primary) {
       const candidate = document.querySelector(selector);
       if (candidate && !candidate.disabled) {
         sendButton = candidate;
@@ -112,11 +201,17 @@
       }
     }
 
+    // Fallback to resilient query
+    if (!sendButton && queryResilient) {
+      sendButton = queryResilient(sendStrategies, { timeout: 500 });
+    }
+
     if (sendButton) {
       sendButton.click();
       return;
     }
 
+    // Final fallback: simulate Enter key
     composer.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'Enter',
       code: 'Enter',
