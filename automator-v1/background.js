@@ -706,11 +706,21 @@ async function dispatchMessageToAgent(state, agentId, text, taskId = null) {
       enrichedText = text + '\n\n---\nATTACHED DELIVERABLES FROM PREVIOUS AGENT:\n' + fileList + 
                      '\n\nUse sidecar.getFileData(fileId) to retrieve each file.';
       
-      // Prepare files for attachment by converting data URLs to sendable format
-      filesToSend = files.map(f => ({
-        dataUrl: f.dataUrl || '', // Will be populated from getFileData
-        fileName: f.fileName
-      }));
+      // Prepare files for attachment by fetching actual data URLs
+      for (const f of files) {
+        try {
+          const fileData = await getFileData(f.fileId);
+          if (fileData && fileData.dataUrl) {
+            filesToSend.push({
+              dataUrl: fileData.dataUrl,
+              fileName: f.fileName
+            });
+          }
+        } catch (error) {
+          console.error('Failed to fetch file data for:', f.fileName, error);
+          logEvent(state, 'FILE_DATA_FETCH_FAILED', { fileId: f.fileId, error: error.message });
+        }
+      }
     }
   }
   
