@@ -26,7 +26,11 @@ coverage/
 *.min.js
 *.min.css
 
-# OS generated files
+# Editors
+.vscode/
+.idea/
+
+# OS specific
 .DS_Store
 Thumbs.db
 
