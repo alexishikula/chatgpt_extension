@@ -176,6 +176,18 @@ function resetAgentForm() {
   $('agentDescription').value = '';
   $('saveAgentButton').textContent = 'Create agent';
   $('cancelEditButton').classList.add('hidden');
+  // Hide the form after reset if it was open
+  const form = $('createAgentForm');
+  const createButton = $('createAgentButton');
+  if (form && !form.classList.contains('hidden')) {
+    form.classList.add('hidden');
+    if (createButton) {
+      createButton.innerHTML = `
+        <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5V19"/><path d="M5 12H19"/></svg>
+        Create New Agent
+      `;
+    }
+  }
 }
 
 async function startEditAgent(agentId) {
@@ -281,13 +293,58 @@ $('pauseButton').addEventListener('click', async () => {
   catch (error) { showMessage(error.message); }
 });
 
-$('refreshButton').addEventListener('click', async () => {
+$('refreshButton')?.addEventListener('click', async () => {
   try {
     await call({ type: 'AUTOMATOR_RECONCILE_NOW' });
     await refreshTabs();
     showMessage('Reconciled.');
   } catch (error) { showMessage(error.message); }
 });
+
+// Toggle section collapse/expand
+function toggleSection(contentId, chevronId) {
+  const content = $(contentId);
+  const chevron = $(chevronId);
+  
+  if (!content || !chevron) return;
+  
+  const isCollapsed = content.classList.contains('collapsed');
+  
+  if (isCollapsed) {
+    content.classList.remove('collapsed');
+    chevron.classList.remove('collapsed');
+  } else {
+    content.classList.add('collapsed');
+    chevron.classList.add('collapsed');
+  }
+}
+
+// Toggle create agent form visibility
+function toggleCreateAgentForm() {
+  const form = $('createAgentForm');
+  const createButton = $('createAgentButton');
+  
+  if (!form) return;
+  
+  const isHidden = form.classList.contains('hidden');
+  
+  if (isHidden) {
+    form.classList.remove('hidden');
+    createButton.innerHTML = `
+      <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 9l-7 7-7-7"/></svg>
+      Hide Form
+    `;
+    // Focus on first input when opening
+    setTimeout(() => $('agentType')?.focus(), 100);
+  } else {
+    form.classList.add('hidden');
+    createButton.innerHTML = `
+      <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5V19"/><path d="M5 12H19"/></svg>
+      Create New Agent
+    `;
+    resetAgentForm();
+  }
+}
 
 $('clearButton').addEventListener('click', async () => {
   if (!confirm('Reset all local Automator agents, tasks, gates, and logs?')) return;

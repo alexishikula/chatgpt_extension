@@ -52,57 +52,59 @@
   </section>
   
   <section class="main-section">
-    <div class="section-head">
+    <div class="section-head collapsible" onclick="toggleSection('agents-content', 'agents-chevron')">
       <h2><svg class="section-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21V19C17 16.7909 15.2091 15 13 15H5C2.79086 15 1 16.7909 1 19V21"/><path d="M9 11C11.2091 11 13 9.20914 13 7C13 4.79086 11.2091 3 9 3C6.79086 3 5 4.79086 5 7C5 9.20914 6.79086 11 9 11Z"/><path d="M23 21V19C22.9993 18.1771 22.7988 17.3656 22.416 16.6347C22.0332 15.9038 21.4801 15.2756 20.8 14.8"/><path d="M16 3.13C16.8604 3.00508 17.7389 3.09901 18.5472 3.40245C19.3555 3.70589 20.0649 4.20845 20.6039 4.85947C21.1428 5.51049 21.4925 6.28713 21.6161 7.1096C21.7397 7.93207 21.6326 8.77079 21.306 9.53352"/></svg> Agents</h2>
-      <button id="refreshButton" class="btn btn-secondary btn-sm">
-        <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4V10H17"/><path d="M1 20V14H7"/><path d="M3.51 9.00001C4.01717 7.56678 4.97491 6.3344 6.26209 5.45882C7.54927 4.58324 9.10772 4.1015 10.71 4.08201C12.3123 4.06251 13.8812 4.50617 15.2069 5.35378C16.5326 6.20139 17.5512 7.41331 18.14 8.84001L23 10M1 14C1.51297 15.4606 2.50763 16.7138 3.83896 17.5771C5.17029 18.4405 6.76821 18.8685 8.39001 18.795C10.0118 18.7215 11.5696 18.1905 12.85 17.274C14.1304 16.3575 15.0719 15.0998 15.56 13.65L1 14Z"/></svg>
-        Reconcile
+      <button id="createAgentButton" class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); toggleCreateAgentForm()">
+        <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5V19"/><path d="M5 12H19"/></svg>
+        Create New Agent
       </button>
+      <svg id="agents-chevron" class="chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
     </div>
-    <p class="hint">Create an agent, describe it, and assign one open ChatGPT conversation to it. Automator remembers the conversation even if Chrome later gives the tab a different ID.</p>
-
-    <div class="agent-form">
-      <div class="form-grid">
-        <label class="form-field">
-          <span class="field-label">Type</span>
-          <select id="agentType">
-            <option value="SPECIALIST">Specialist Agent</option>
-            <option value="PM">Project Manager</option>
-          </select>
-        </label>
-        <label class="form-field">
-          <span class="field-label">Agent ID</span>
-          <input id="agentId" placeholder="firmware_engineer" autocomplete="off" />
-        </label>
-      </div>
-      <label class="form-field">
-        <span class="field-label">Name</span>
-        <input id="agentName" placeholder="e.g., Firmware Engineer" autocomplete="off" />
-      </label>
-      <label class="form-field">
-        <span class="field-label">Description</span>
-        <textarea id="agentDescription" rows="2" placeholder="Describe what this agent handles..."></textarea>
-      </label>
-      <label class="form-field">
-        <span class="field-label">ChatGPT Conversation</span>
-        <div class="select-wrapper">
-          <select id="tabSelect"></select>
+    
+    <div id="agents-content" class="section-content">
+      <div id="createAgentForm" class="agent-form hidden">
+        <div class="form-grid">
+          <label class="form-field">
+            <span class="field-label">Type</span>
+            <select id="agentType">
+              <option value="SPECIALIST">Specialist Agent</option>
+              <option value="PM">Project Manager</option>
+            </select>
+          </label>
+          <label class="form-field">
+            <span class="field-label">Agent ID</span>
+            <input id="agentId" placeholder="firmware_engineer" autocomplete="off" />
+          </label>
         </div>
-      </label>
-      <div class="form-actions">
-        <button id="saveAgentButton" class="btn btn-primary">
-          <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5V19"/><path d="M5 12H19"/></svg>
-          Create Agent
-        </button>
-        <button id="cancelEditButton" class="btn btn-secondary hidden">Cancel</button>
-        <button id="refreshTabsButton" class="btn btn-ghost btn-sm">
-          <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4V10H17"/><path d="M1 20V14H7"/><path d="M3.51 9.00001C4.01717 7.56678 4.97491 6.3344 6.26209 5.45882C7.54927 4.58324 9.10772 4.1015 10.71 4.08201C12.3123 4.06251 13.8812 4.50617 15.2069 5.35378C16.5326 6.20139 17.5512 7.41331 18.14 8.84001L23 10M1 14C1.51297 15.4606 2.50763 16.7138 3.83896 17.5771C5.17029 18.4405 6.76821 18.8685 8.39001 18.795C10.0118 18.7215 11.5696 18.1905 12.85 17.274C14.1304 16.3575 15.0719 15.0998 15.56 13.65L1 14Z"/></svg>
-          Refresh Tabs
-        </button>
+        <label class="form-field">
+          <span class="field-label">Name</span>
+          <input id="agentName" placeholder="e.g., Firmware Engineer" autocomplete="off" />
+        </label>
+        <label class="form-field">
+          <span class="field-label">Description</span>
+          <textarea id="agentDescription" rows="2" placeholder="Describe what this agent handles..."></textarea>
+        </label>
+        <label class="form-field">
+          <span class="field-label">ChatGPT Conversation</span>
+          <div class="select-wrapper">
+            <select id="tabSelect"></select>
+          </div>
+        </label>
+        <div class="form-actions">
+          <button id="saveAgentButton" class="btn btn-primary">
+            <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5V19"/><path d="M5 12H19"/></svg>
+            Create Agent
+          </button>
+          <button id="cancelEditButton" class="btn btn-secondary hidden">Cancel</button>
+          <button id="refreshTabsButton" class="btn btn-ghost btn-sm">
+            <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4V10H17"/><path d="M1 20V14H7"/><path d="M3.51 9.00001C4.01717 7.56678 4.97491 6.3344 6.26209 5.45882C7.54927 4.58324 9.10772 4.1015 10.71 4.08201C12.3123 4.06251 13.8812 4.50617 15.2069 5.35378C16.5326 6.20139 17.5512 7.41331 18.14 8.84001L23 10M1 14C1.51297 15.4606 2.50763 16.7138 3.83896 17.5771C5.17029 18.4405 6.76821 18.8685 8.39001 18.795C10.0118 18.7215 11.5696 18.1905 12.85 17.274C14.1304 16.3575 15.0719 15.0998 15.56 13.65L1 14Z"/></svg>
+            Refresh Tabs
+          </button>
+        </div>
       </div>
-    </div>
 
-    <div id="agents" class="card-list"></div>
+      <div id="agents" class="card-list"></div>
+    </div>
   </section>
   
   <section class="main-section">
