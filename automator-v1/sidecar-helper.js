@@ -145,13 +145,22 @@ class AutomatorSidecarHelper {
 
     const actualFileName = fileName || fileData.fileName;
     
-    // Create download link
-    const link = document.createElement('a');
-    link.href = fileData.dataUrl;
-    link.download = actualFileName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    // Convert data URL to blob and create object URL for cleaner download
+    const blob = this.dataUrlToBlob(fileData.dataUrl);
+    const objectUrl = URL.createObjectURL(blob);
+    
+    try {
+      // Create download link
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = actualFileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      // Clean up the object URL to prevent memory leaks
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 100);
+    }
   }
 
   /**

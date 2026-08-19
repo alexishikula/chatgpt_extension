@@ -1,8 +1,9 @@
 const STORAGE_KEY = 'automatorStateV1';
 const FILE_SIDECAR_KEY = 'automatorFileSidecarV1';
 const RECONCILE_ALARM = 'automator-reconcile';
+const PM_REVIEW_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes timeout for PM review
 const CHATGPT_URL_RE = /^https:\/\/(chatgpt\.com|chat\.openai\.com)\//i;
-const ACTIVE_TASK_STATES = new Set(['DISPATCHING', 'RUNNING', 'RESPONSE_NO_VALID_RESULT']);
+const ACTIVE_TASK_STATES = new Set(['DISPATCHING', 'RUNNING', 'RESPONSE_NO_VALID_RESULT', 'RESULT_RECEIVED', 'PM_REVIEW', 'RESULT_RETURN_FAILED']);
 const TERMINAL_TASK_STATES = new Set(['COMPLETED', 'CANCELLED']);
 const AGENT_RESULT_STATUSES = new Set([
   'COMPLETE',
@@ -642,7 +643,25 @@ function validateAgentResult(state, sourceAgentId, command) {
     return `Task ${taskId} is assigned to ${task.assignedToAgentId}, not ${sourceAgentId}.`;
   }
   if (!AGENT_RESULT_STATUSES.has(String(command.status || ''))) {
-    return `Unsupported TASK_RESULT status: ${command.status || '(missing)'}.`;
+    // Try to normalize common status typos before rejecting
+    const statusMap = {
+      'COMPLETED': 'COMPLETE',
+      'FAIL': 'FAILED',
+      'FAILURE': 'FAILED',
+      'ESCALATE': 'ESCALATION_REQUIRED',
+      'OWNER_ACTION': 'OWNER_ACTION_REQUIRED'
+    };
+    const normalized = statusMap[String(command.status || '')];
+    if (normalized && AGENT_RESULT_STATUSES.has(normalized)) {
+      command.status = normalized;
+      logEvent(state, 'STATUS_AUTO_CORRECTED', { 
+        taskId, 
+        originalStatus: String(command.status), 
+        correctedStatus: normalized 
+      });
+    } else {
+      return `Unsupported TASK_RESULT status: ${command.status || '(missing)'}. Valid: COMPLETE, FAILED, ESCALATION_REQUIRED, OWNER_ACTION_REQUIRED`;
+    }
   }
   if (TERMINAL_TASK_STATES.has(task.status)) return `Task ${taskId} is already ${task.status}.`;
   return null;
@@ -698,18 +717,37 @@ async function dispatchMessageToAgent(state, agentId, text, taskId = null) {
   
   // If there are files in the sidecar for this task, include file metadata in the message
   let enrichedText = text;
+  let filesToSend = [];
   if (taskId) {
     const files = await getFilesForTask(taskId);
     if (files && files.length > 0) {
       const fileList = files.map(f => `- ${f.fileName} (${f.fileType}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`).join('\n');
       enrichedText = text + '\n\n---\nATTACHED DELIVERABLES FROM PREVIOUS AGENT:\n' + fileList + 
                      '\n\nUse sidecar.getFileData(fileId) to retrieve each file.';
+      
+      // Prepare files for attachment by fetching actual data URLs
+      for (const f of files) {
+        try {
+          const fileData = await getFileData(f.fileId);
+          if (fileData && fileData.dataUrl) {
+            filesToSend.push({
+              dataUrl: fileData.dataUrl,
+              fileName: f.fileName
+            });
+          }
+        } catch (error) {
+          console.error('Failed to fetch file data for:', f.fileName, error);
+          logEvent(state, 'FILE_DATA_FETCH_FAILED', { fileId: f.fileId, error: error.message });
+        }
+      }
     }
   }
   
+  // Use the new message type that supports file attachments
   const response = await sendToTab(tab.id, {
-    type: 'AUTOMATOR_SEND_MESSAGE',
+    type: 'AUTOMATOR_SEND_MESSAGE_WITH_FILES',
     text: enrichedText,
+    files: filesToSend,
     taskId
   });
   logEvent(state, 'DISPATCH_MESSAGE_TO_AGENT', { 
@@ -839,6 +877,8 @@ function buildValidationCorrection(error, sourceType, activeTaskId = null) {
     lines.push('');
     lines.push('HINT: Allowed status values are: COMPLETE, FAILED, ESCALATION_REQUIRED, OWNER_ACTION_REQUIRED');
     lines.push('(Note: "COMPLETED" is invalid - use "COMPLETE" without the D)');
+    lines.push('(Note: "FAIL" is invalid - use "FAILED")');
+    lines.push('(Note: "ESCALATE" is invalid - use "ESCALATION_REQUIRED")');
   }
   
   if (error.includes('task_id') || error.includes('TASK_RESULT requires')) {
@@ -859,12 +899,28 @@ function buildValidationCorrection(error, sourceType, activeTaskId = null) {
     lines.push('- All string values must be in double quotes: "value" not value');
     lines.push('- No trailing commas after the last item in objects or arrays');
     lines.push('- Use proper escaping for quotes inside strings');
+    lines.push('');
+    lines.push('Example correct format:');
+    lines.push('<<AUTOMATOR>>');
+    lines.push('{');
+    lines.push('  "action": "TASK_RESULT",');
+    lines.push('  "task_id": "TASK-001",');
+    lines.push('  "status": "COMPLETE",');
+    lines.push('  "summary": "Task completed successfully"');
+    lines.push('}');
+    lines.push('<<END_AUTOMATOR>>');
   }
   
   if (error.includes('assigned to') || error.includes('Unknown task_id')) {
     lines.push('');
     lines.push('HINT: Verify that your task_id matches an existing task assigned to you.');
     lines.push('If you see "Unknown task_id", the task may have been completed already or has a different ID.');
+  }
+  
+  if (error.includes('extracted') || error.includes('unstructured')) {
+    lines.push('');
+    lines.push('HINT: Your response was partially understood but missing proper formatting.');
+    lines.push('Always wrap your JSON in <<AUTOMATOR>>...<<END_AUTOMATOR>> tags.');
   }
   
   return lines.join('\n');
@@ -1190,6 +1246,42 @@ async function reconcileAgentTabs() {
 async function reconcile() {
   await reconcileAgentTabs();
   const state = await loadState();
+  
+  // Recovery: Check for stuck tasks in PM_REVIEW or RESULT_RETURN_FAILED states
+  // and reset them to allow PM to re-dispatch
+  const now = Date.now();
+  for (const [taskId, task] of Object.entries(state.tasks)) {
+    if (task.status === 'PM_REVIEW' && task.returnedToPmAt) {
+      const reviewAge = now - new Date(task.returnedToPmAt).getTime();
+      if (reviewAge > PM_REVIEW_TIMEOUT_MS) {
+        task.status = 'RESPONSE_NO_VALID_RESULT';
+        task.error = `PM review timeout after ${Math.round(reviewAge / 60000)} minutes`;
+        task.updatedAt = nowIso();
+        logEvent(state, 'TASK_PM_REVIEW_TIMEOUT', { 
+          taskId, 
+          reviewAgeMinutes: Math.round(reviewAge / 60000),
+          returnedToPmAt: task.returnedToPmAt
+        });
+      }
+    } else if (task.status === 'RESULT_RETURN_FAILED') {
+      // Allow retry of failed result returns by resetting to RUNNING
+      task.status = 'RUNNING';
+      task.error = null;
+      task.updatedAt = nowIso();
+      logEvent(state, 'TASK_RESULT_RETURN_RETRY', { taskId });
+    } else if (task.status === 'RESULT_RECEIVED') {
+      // If task is stuck in RESULT_RECEIVED (should quickly move to PM_REVIEW),
+      // force it back to RUNNING so agent can retry
+      const receivedAge = task.updatedAt ? (now - new Date(task.updatedAt).getTime()) : Infinity;
+      if (receivedAge > 2 * 60 * 1000) { // 2 minutes
+        task.status = 'RUNNING';
+        task.error = 'Stuck in RESULT_RECEIVED state - retrying';
+        task.updatedAt = nowIso();
+        logEvent(state, 'TASK_RESULT_RECEIVED_TIMEOUT', { taskId });
+      }
+    }
+  }
+  
   for (const agent of Object.values(state.agents)) {
     if (!agent.tabId) continue;
     const response = await sendToTab(agent.tabId, { type: 'AUTOMATOR_GET_LAST_ASSISTANT' });
