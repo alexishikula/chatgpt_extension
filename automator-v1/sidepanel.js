@@ -116,6 +116,16 @@ function renderTasks() {
   $('tasks').className = tasks.length ? '' : 'empty';
   $('tasks').innerHTML = tasks.length ? tasks.slice(0, 25).map((task) => {
     const target = state.agents?.[task.assignedToAgentId];
+    const requiresPmReview = task.requiresPmReviewForDownload || task.status === 'PM_REVIEW';
+    const pmReviewControls = requiresPmReview ? `
+      <div class="pm-review-controls">
+        <div class="muted" style="color: #f59e0b; font-weight: bold;">⚠️ PM Review Required</div>
+        <div class="card-actions">
+          <button data-approve-download="${esc(task.id)}" style="background: #10b981;">Approve Download</button>
+          <button data-reject-download="${esc(task.id)}" style="background: #ef4444;">Reject Download</button>
+        </div>
+      </div>
+    ` : '';
     return `
       <div class="card">
         <div class="card-row">
@@ -124,6 +134,8 @@ function renderTasks() {
         </div>
         <div class="muted">${esc(target?.name || task.assignedToAgentId || 'Unknown agent')}</div>
         ${task.agentStatus ? `<div class="agent-id">Agent result: ${esc(task.agentStatus)}</div>` : ''}
+        ${task.downloadUrl ? `<div class="muted">📎 Download: ${esc(task.downloadUrl)}</div>` : ''}
+        ${pmReviewControls}
       </div>
     `;
   }).join('') : 'No tasks yet.';
@@ -267,6 +279,8 @@ document.addEventListener('click', async (event) => {
   const removeAgentId = event.target?.dataset?.removeAgent;
   const gateId = event.target?.dataset?.gate;
   const resolution = event.target?.dataset?.resolution;
+  const approveDownloadTaskId = event.target?.dataset?.approveDownload;
+  const rejectDownloadTaskId = event.target?.dataset?.rejectDownload;
 
   try {
     if (openAgentId) await call({ type: 'AUTOMATOR_OPEN_AGENT', agentId: openAgentId });
@@ -280,6 +294,29 @@ document.addEventListener('click', async (event) => {
     if (gateId && resolution) {
       const comment = prompt(`Optional owner comment for ${resolution}:`, '') || '';
       await call({ type: 'AUTOMATOR_RESOLVE_GATE', gateId, resolution, comment });
+    }
+    // PM approval/rejection of downloads
+    if (approveDownloadTaskId) {
+      const task = state.tasks[approveDownloadTaskId];
+      const fileId = task?.downloadFileId || null;
+      const downloadUrl = task?.downloadUrl || null;
+      await call({ 
+        type: 'AUTOMATOR_APPROVE_DOWNLOAD', 
+        taskId: approveDownloadTaskId,
+        fileId,
+        downloadUrl
+      });
+      showMessage('Download approved. Starting download...');
+    }
+    if (rejectDownloadTaskId) {
+      const comment = prompt('Reason for rejecting download:', 'Download rejected by PM') || 'Download rejected by PM';
+      await call({ 
+        type: 'AUTOMATOR_UPDATE_TASK_STATUS',
+        taskId: rejectDownloadTaskId,
+        status: 'BLOCKED',
+        note: comment
+      });
+      showMessage('Download rejected. Task blocked.');
     }
   } catch (error) {
     showMessage(error.message);

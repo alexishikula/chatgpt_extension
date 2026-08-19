@@ -127,6 +127,47 @@
     }));
   }
 
+  // P0 Guard Rail: Automatically inject file into ChatGPT input for next agent
+  async function injectFileIntoChat(fileBlob, fileName, fileType) {
+    const composer = findComposer();
+    if (!composer) throw new Error('ChatGPT message composer was not found.');
+    
+    // Create file input element and attach the blob
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '*/*';
+    fileInput.style.display = 'none';
+    
+    // Create a File from the blob
+    const file = new File([fileBlob], fileName, { type: fileType });
+    
+    // Use DataTransfer to programmatically set files on input
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    fileInput.files = dataTransfer.files;
+    
+    // Dispatch change event to notify React/ChatGPT of the file
+    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    
+    // Append to composer or nearby attachment area
+    const attachmentArea = composer.closest('form') || composer.parentElement;
+    if (attachmentArea) {
+      attachmentArea.appendChild(fileInput);
+    }
+    
+    // Small delay to allow UI to register the file
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    
+    // Clean up the input element after it's been processed
+    setTimeout(() => {
+      if (fileInput.parentElement) {
+        fileInput.remove();
+      }
+    }, 2000);
+    
+    return { ok: true, fileName, size: fileBlob.size };
+  }
+
   async function announceLatest() {
     const message = getLastAssistantMessage();
     if (!message || message.streaming || message.fingerprint === lastAnnouncedFingerprint) return;
@@ -268,6 +309,22 @@
         const lastMsg = getLastAssistantMessage();
         const links = lastMsg && lastMsg.text ? extractMarkdownLinks(lastMsg.text) : [];
         sendResponse({ ok: true, links, text: lastMsg?.text || '' });
+        return;
+      }
+      // P0 Guard Rail: Inject file blob into ChatGPT input for next agent
+      if (message?.type === 'AUTOMATOR_INJECT_FILE') {
+        const { fileBlobBase64, fileName, fileType } = message;
+        try {
+          // Convert base64 back to blob
+          const response = await fetch(`data:${fileType};base64,${fileBlobBase64}`);
+          const blob = await response.blob();
+          
+          // Inject the file into the chat composer
+          const result = await injectFileIntoChat(blob, fileName, fileType);
+          sendResponse(result);
+        } catch (error) {
+          sendResponse({ ok: false, error: String(error.message || error) });
+        }
         return;
       }
       sendResponse({ ok: false, error: 'Unknown content-script message' });

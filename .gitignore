@@ -1,7 +1,71 @@
-# Examples 1 and 2 show that only source/config files were added/modified, so no .gitignore content is needed
+```
+# Logs and temp files
+*.log
+*.tmp
+*.swp
 
-# Source files like .md and .js don't need to be ignored
-# Only build artifacts, dependencies, temp files, etc. should be in .gitignore
+# Environment
+.env
+.env.local
+*.env.*
 
-# In this case, only a markdown file and a JavaScript file were changed
-# These are source files that should be tracked by git
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+target/
+.gradle/
+
+# Editors
+.vscode/
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Compiled files
+*.pyc
+*.class
+*.o
+*.exe
+*.dll
+*.so
+*.a
+*.obj
+*.out
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+```
