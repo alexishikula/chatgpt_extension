@@ -23,10 +23,18 @@ function slug(value) {
 }
 
 function showMessage(text) {
-  $('message').textContent = text || '';
-  if (text) setTimeout(() => {
-    if ($('message').textContent === text) $('message').textContent = '';
-  }, 4500);
+  const messageEl = $('message');
+  messageEl.textContent = text || '';
+  if (text) {
+    // Add animation class for smooth entrance
+    messageEl.classList.add('show');
+    setTimeout(() => {
+      if (messageEl.textContent === text) {
+        messageEl.textContent = '';
+        messageEl.classList.remove('show');
+      }
+    }, 4500);
+  }
 }
 
 async function call(message) {
@@ -104,8 +112,14 @@ function renderGates() {
       <div class="muted">${esc(gate.instructions || '')}</div>
       ${gate.taskId ? `<div class="agent-id">Task: ${esc(gate.taskId)}</div>` : ''}
       <div class="card-actions">
-        <button data-gate="${esc(gate.id)}" data-resolution="PASS" class="btn btn-primary btn-sm">Approve / Pass</button>
-        <button data-gate="${esc(gate.id)}" data-resolution="FAIL" class="btn btn-danger btn-sm">Reject / Fail</button>
+        <button data-gate="${esc(gate.id)}" data-resolution="PASS" class="btn btn-primary btn-sm" title="Approve and pass">
+          <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          Approve
+        </button>
+        <button data-gate="${esc(gate.id)}" data-resolution="FAIL" class="btn btn-danger btn-sm" title="Reject and fail">
+          <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          Reject
+        </button>
       </div>
     </div>
   `).join('') : '<div class="empty-message"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z"/><path d="M12 18V12"/><path d="M12 8H12.01"/></svg><p>No active gates requiring your attention</p></div>';
@@ -182,6 +196,8 @@ async function startEditAgent(agentId) {
 
 async function init() {
   try {
+    // Show loading state initially
+    showLoadingState();
     const response = await call({ type: 'AUTOMATOR_GET_STATE' });
     state = response.state;
     render();
@@ -189,6 +205,27 @@ async function init() {
   } catch (error) {
     showMessage(error.message);
   }
+}
+
+function showLoadingState() {
+  $('agents').innerHTML = `
+    <div class="loading-state">
+      <div class="loading-spinner"></div>
+      <p class="muted">Loading Automator...</p>
+    </div>
+  `;
+  $('gates').innerHTML = `
+    <div class="loading-state">
+      <div class="loading-spinner"></div>
+      <p class="muted">Loading gates...</p>
+    </div>
+  `;
+  $('tasks').innerHTML = `
+    <div class="loading-state">
+      <div class="loading-spinner"></div>
+      <p class="muted">Loading tasks...</p>
+    </div>
+  `;
 }
 
 $('agentName').addEventListener('input', () => {
