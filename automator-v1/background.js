@@ -15,6 +15,8 @@ const MAX_TOTAL_STORAGE_BYTES = 50 * 1024 * 1024; // 50MB total
 
 // Import the LLM Robust Parser
 import { LlmRobustParser } from './src/utils/llm-robust-parser.js';
+// Import the Smart Request Retrier for network resilience
+import { retryRequest } from './src/utils/request-retrier.js';
 
 let stateMutationQueue = Promise.resolve();
 
@@ -249,8 +251,16 @@ async function mutateState(mutator) {
 }
 
 async function sendToTab(tabId, message) {
-  try {
+  const sendFn = async () => {
     return await chrome.tabs.sendMessage(tabId, message);
+  };
+
+  try {
+    // Use retry logic for transient tab communication errors
+    return await retryRequest(sendFn, 
+      { maxRetries: 2, baseDelay: 500 }, 
+      { operation: 'sendToTab', tabId }
+    );
   } catch (firstError) {
     // Tabs that were already open when the extension was installed may not yet
     // have the declared content script. Inject the adapter once and retry.
@@ -259,7 +269,11 @@ async function sendToTab(tabId, message) {
         target: { tabId },
         files: ['content.js']
       });
-      return await chrome.tabs.sendMessage(tabId, message);
+      // Retry after injection with retry logic
+      return await retryRequest(sendFn,
+        { maxRetries: 2, baseDelay: 500 },
+        { operation: 'sendToTabAfterInject', tabId }
+      );
     } catch (secondError) {
       return {
         ok: false,
