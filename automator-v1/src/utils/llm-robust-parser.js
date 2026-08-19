@@ -281,6 +281,48 @@ function handleParseFailure(error, rawText, stage) {
  */
 class LlmRobustParser {
   /**
+   * Layer 1: Syntax Repair (The "Cleaner")
+   * Repairs common JSON syntax issues before parsing.
+   * @param {string} rawText - The raw text input that may contain JSON
+   * @returns {string} - Cleaned JSON string ready for parsing
+   */
+  static repairJsonString(rawText) {
+    return repairJsonString(rawText);
+  }
+
+  /**
+   * Layer 2: Semantic Normalization (The "Translator")
+   * Normalizes parsed object values to standard formats.
+   * @param {object} parsedObject - The parsed JSON object
+   * @returns {object} - Normalized object with standardized values
+   */
+  static normalizeValues(parsedObject) {
+    return normalizeValues(parsedObject);
+  }
+
+  /**
+   * Layer 3: Intent Extraction (The "Detective")
+   * Extracts structured intent from plain text when JSON parsing fails.
+   * @param {string} rawText - The raw text input
+   * @returns {object|null} - Extracted intent object or null if nothing found
+   */
+  static extractIntentFromText(rawText) {
+    return extractIntentFromText(rawText) || {};
+  }
+
+  /**
+   * Layer 4: Graceful Degradation (The "Safety Net")
+   * Handles parse failures with standardized error objects.
+   * @param {Error} error - The caught error
+   * @param {string} rawText - The original raw text that caused the failure
+   * @param {string} stage - The stage where the failure occurred
+   * @returns {object} - Standardized error payload
+   */
+  static handleParseFailure(error, rawText, stage) {
+    return handleParseFailure(error, rawText, stage);
+  }
+
+  /**
    * Parse raw text into a structured object with robust error handling.
    * @param {string} rawText - The raw text input from LLM
    * @returns {object} - Parse result with success flag and data/error
