@@ -116,6 +116,7 @@ function renderTasks() {
   $('tasks').className = tasks.length ? '' : 'empty';
   $('tasks').innerHTML = tasks.length ? tasks.slice(0, 25).map((task) => {
     const target = state.agents?.[task.assignedToAgentId];
+    // PM review logic removed - downloads are now automatic
     return `
       <div class="card">
         <div class="card-row">
@@ -124,6 +125,7 @@ function renderTasks() {
         </div>
         <div class="muted">${esc(target?.name || task.assignedToAgentId || 'Unknown agent')}</div>
         ${task.agentStatus ? `<div class="agent-id">Agent result: ${esc(task.agentStatus)}</div>` : ''}
+        ${task.downloadUrl ? `<div class="muted">📎 Downloaded: ${esc(task.downloadUrl)}</div>` : ''}
       </div>
     `;
   }).join('') : 'No tasks yet.';
@@ -267,6 +269,8 @@ document.addEventListener('click', async (event) => {
   const removeAgentId = event.target?.dataset?.removeAgent;
   const gateId = event.target?.dataset?.gate;
   const resolution = event.target?.dataset?.resolution;
+  const approveDownloadTaskId = event.target?.dataset?.approveDownload;
+  const rejectDownloadTaskId = event.target?.dataset?.rejectDownload;
 
   try {
     if (openAgentId) await call({ type: 'AUTOMATOR_OPEN_AGENT', agentId: openAgentId });
@@ -281,6 +285,7 @@ document.addEventListener('click', async (event) => {
       const comment = prompt(`Optional owner comment for ${resolution}:`, '') || '';
       await call({ type: 'AUTOMATOR_RESOLVE_GATE', gateId, resolution, comment });
     }
+    // PM approval/rejection of downloads - REMOVED: Downloads are now automatic
   } catch (error) {
     showMessage(error.message);
   }

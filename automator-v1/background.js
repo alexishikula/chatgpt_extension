@@ -631,7 +631,7 @@ function validatePmCommand(state, command) {
   return null;
 }
 
-function validateAgentResult(state, sourceAgentId, command) {
+async function validateAgentResult(state, sourceAgentId, command) {
   if (!command || typeof command !== 'object' || Array.isArray(command)) return 'Result must be a JSON object.';
   if (command.action !== 'TASK_RESULT') return `Agents may only return action TASK_RESULT, not ${command.action || '(missing)'}.`;
   const taskId = String(command.task_id || '').trim();
@@ -645,6 +645,39 @@ function validateAgentResult(state, sourceAgentId, command) {
     return `Unsupported TASK_RESULT status: ${command.status || '(missing)'}.`;
   }
   if (TERMINAL_TASK_STATES.has(task.status)) return `Task ${taskId} is already ${task.status}.`;
+  
+  // P0 Guard Rail: Validate download_url if present in command
+  if (command.download_url) {
+    const urlPattern = /^https?:\/\/.+/i;
+    if (!urlPattern.test(command.download_url)) {
+      return 'download_url must be a valid HTTP/HTTPS URL';
+    }
+
+    // Check if matching file exists in sidecar for this task
+    const files = await getFilesForTask(taskId);
+    if (files.length > 0) {
+      const hasMatchingFile = files.some(f =>
+        command.download_url.includes(f.fileName) ||
+        command.download_url.toLowerCase().includes(f.fileName.toLowerCase())
+      );
+
+      if (!hasMatchingFile) {
+        logEvent(state, 'DOWNLOAD_URL_MISMATCH_WARNING', {
+          taskId,
+          downloadUrl: command.download_url,
+          availableFiles: files.map(f => f.fileName)
+        });
+        // Note: This is just a warning - we still proceed with auto-download
+      }
+    } else {
+      // No files in sidecar but download_url provided - just log it
+      logEvent(state, 'DOWNLOAD_URL_WITHOUT_SIDECAR_FILES', {
+        taskId,
+        downloadUrl: command.download_url
+      });
+    }
+
+  }
   return null;
 }
 
@@ -1053,15 +1086,143 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
     deliverableCount: files.length
   });
 
+  // Check if there are files to auto-download or download_url in command
+  const hasFiles = files && files.length > 0;
+  const hasDownloadUrl = command.download_url ? true : false;
+  
+  if (hasFiles || hasDownloadUrl) {
+    // Auto-trigger downloads immediately - no PM approval needed
+    try {
+      // Download files from sidecar
+      if (hasFiles) {
+        for (const file of files) {
+          const fileData = await getFileData(file.fileId);
+          if (fileData && fileData.dataUrl) {
+            try {
+              // Convert data URL to blob for chrome.downloads
+              const response = await fetch(fileData.dataUrl);
+              const blob = await response.blob();
+              const url = URL.createObjectURL(blob);
+              
+              await chrome.downloads.download({
+                url: url,
+                filename: fileData.fileName,
+                saveAs: false
+              });
+              
+              logEvent(state, 'FILE_AUTO_DOWNLOADED', {
+                fileId: file.fileId,
+                fileName: fileData.fileName,
+                taskId: task.id
+              });
+              
+              // Clean up object URL after download starts to prevent memory leaks
+              setTimeout(() => URL.revokeObjectURL(url), 5000);
+            } catch (downloadError) {
+              logEvent(state, 'FILE_AUTO_DOWNLOAD_FAILED', {
+                fileId: file.fileId,
+                error: String(downloadError.message || downloadError)
+              });
+            }
+          }
+        }
+      }
+      
+      // Download from URL if provided
+      if (hasDownloadUrl) {
+        try {
+          await chrome.downloads.download({
+            url: command.download_url,
+            saveAs: false
+          });
+          
+          logEvent(state, 'URL_AUTO_DOWNLOADED', {
+            taskId: task.id,
+            downloadUrl: command.download_url
+          });
+        } catch (urlError) {
+          logEvent(state, 'URL_AUTO_DOWNLOAD_FAILED', {
+            taskId: task.id,
+            error: String(urlError.message || urlError)
+          });
+        }
+      }
+    } catch (error) {
+      logEvent(state, 'AUTO_DOWNLOAD_PROCESS_FAILED', {
+        error: String(error.message || error)
+      });
+    }
+  }
+
   try {
+    // First, inject files into the next agent's ChatGPT input if files exist
+    if (hasFiles && task.returnToAgentId) {
+      try {
+        const targetTab = await resolveTabForAgent(state, normalizeAgentId(task.returnToAgentId));
+        
+        // Inject each file into the chat composer with retry logic
+        for (const file of files) {
+          const fileData = await getFileData(file.fileId);
+          if (fileData && fileData.dataUrl) {
+            // Extract base64 from data URL (format: "data:type;base64,base64data")
+            const base64Data = fileData.dataUrl.split(',')[1];
+            const fileType = fileData.dataUrl.split(';')[0].replace('data:', '');
+            
+            // Retry injection up to 3 times with delays
+            let injected = false;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                const result = await chrome.tabs.sendMessage(targetTab.id, {
+                  type: 'AUTOMATOR_INJECT_FILE',
+                  fileBlobBase64: base64Data,
+                  fileName: fileData.fileName,
+                  fileType: fileType
+                });
+                
+                if (result && result.ok) {
+                  injected = true;
+                  logEvent(state, 'FILE_INJECTED_TO_NEXT_AGENT', {
+                    fileId: file.fileId,
+                    fileName: fileData.fileName,
+                    taskId: task.id,
+                    targetAgentId: task.returnToAgentId,
+                    targetTabId: targetTab.id,
+                    attempt
+                  });
+                  break;
+                }
+              } catch (injectError) {
+                if (attempt < 3) {
+                  await new Promise(resolve => setTimeout(resolve, 500));
+                  continue;
+                }
+                throw injectError;
+              }
+            }
+            
+            if (!injected) {
+              throw new Error('Failed to inject file after 3 attempts');
+            }
+          }
+        }
+        
+        // Delay to allow UI to process injected files and auto-send
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (injectError) {
+        logEvent(state, 'FILE_INJECTION_FAILED', {
+          error: String(injectError.message || injectError),
+          taskId: task.id
+        });
+      }
+    }
+    
     await dispatchMessageToAgent(
       state,
       task.returnToAgentId,
       buildPmResultEnvelope(sourceAgent, task, command, rawText, files),
       task.id
     );
-    task.status = 'PM_REVIEW';
-    task.returnedToPmAt = nowIso();
+    task.status = 'RESULT_RECEIVED';
     task.updatedAt = nowIso();
     logEvent(state, 'RESULT_RETURNED_TO_PM', {
       taskId: task.id,
@@ -1101,6 +1262,62 @@ async function handleAssistantOutput(tabId, payload) {
     }
 
     const sourceAgent = state.agents[sourceAgentId];
+    
+    // P0 Guard Rail: Check for markdown links in payload before protocol parsing
+    if (payload.markdownLinks && payload.markdownLinks.length > 0) {
+      logEvent(state, 'MARKDOWN_LINKS_DETECTED', {
+        sourceAgentId,
+        linkCount: payload.markdownLinks.length,
+        links: payload.markdownLinks
+      });
+      
+      // Auto-request sidecar storage for sandbox: links
+      for (const link of payload.markdownLinks) {
+        if (link.url && link.url.startsWith('sandbox:')) {
+          const taskId = getActiveTaskForAgent(state, sourceAgentId)?.id;
+          if (taskId) {
+            const fileName = link.fullPath.split('/').pop() || 'unknown_file';
+            try {
+              const tabId = sourceAgent.tabId;
+              if (tabId) {
+                const readResult = await sendToTab(tabId, {
+                  type: 'AUTOMATOR_READ_FILE',
+                  filePath: link.fullPath,
+                  fileName,
+                  taskId,
+                  sha256: null
+                });
+                
+                if (readResult && readResult.ok && readResult.dataUrl) {
+                  await storeFileForTask(
+                    taskId,
+                    fileName,
+                    getFileTypeFromName(fileName),
+                    readResult.dataUrl,
+                    {
+                      uploadedByAgentId: sourceAgentId,
+                      description: `Auto-extracted from markdown link: ${link.linkText}`
+                    }
+                  );
+                  logEvent(state, 'FILE_AUTO_EXTRACTED_FROM_MARKDOWN_LINK', {
+                    taskId,
+                    fileName,
+                    linkText: link.linkText
+                  });
+                }
+              }
+            } catch (readError) {
+              logEvent(state, 'MARKDOWN_LINK_FILE_EXTRACTION_FAILED', {
+                taskId,
+                fileName,
+                error: String(readError.message || readError)
+              });
+            }
+          }
+        }
+      }
+    }
+    
     const parsed = parseProtocol(payload.text);
 
     if (!parsed.found) {
@@ -1127,7 +1344,7 @@ async function handleAssistantOutput(tabId, payload) {
     if (sourceAgent?.type === 'PM') {
       validationError = validatePmCommand(state, command);
     } else {
-      validationError = validateAgentResult(state, sourceAgentId, command);
+      validationError = await validateAgentResult(state, sourceAgentId, command);
     }
 
     if (validationError) {
@@ -1238,6 +1455,77 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     switch (message?.type) {
+      // P0 Guard Rail: Auto-process markdown links detected by content script
+      case 'AUTOMATOR_MARKDOWN_LINKS_DETECTED': {
+        const { links, text } = message;
+        const tabId = sender.tab?.id;
+        if (!tabId || !links || links.length === 0) {
+          sendResponse({ ok: false, error: 'No links or tab info' });
+          return;
+        }
+        
+        const state = await loadState();
+        const sourceAgentId = agentIdForTab(state, tabId);
+        if (!sourceAgentId) {
+          sendResponse({ ok: false, error: 'Agent not found for tab' });
+          return;
+        }
+        
+        const sourceAgent = state.agents[sourceAgentId];
+        logEvent(state, 'MARKDOWN_LINKS_AUTO_DETECTED', {
+          sourceAgentId,
+          linkCount: links.length,
+          links
+        });
+        
+        // Auto-request sidecar storage for sandbox: links
+        for (const link of links) {
+          if (link.url && link.url.startsWith('sandbox:')) {
+            const taskId = getActiveTaskForAgent(state, sourceAgentId)?.id;
+            if (taskId) {
+              const fileName = link.fullPath.split('/').pop() || 'unknown_file';
+              try {
+                if (sourceAgent.tabId) {
+                  const readResult = await sendToTab(sourceAgent.tabId, {
+                    type: 'AUTOMATOR_READ_FILE',
+                    filePath: link.fullPath,
+                    fileName,
+                    taskId,
+                    sha256: null
+                  });
+                  
+                  if (readResult && readResult.ok && readResult.dataUrl) {
+                    await storeFileForTask(
+                      taskId,
+                      fileName,
+                      getFileTypeFromName(fileName),
+                      readResult.dataUrl,
+                      {
+                        uploadedByAgentId: sourceAgentId,
+                        description: `Auto-extracted from markdown link: ${link.linkText}`
+                      }
+                    );
+                    logEvent(state, 'FILE_AUTO_EXTRACTED_FROM_MARKDOWN_LINK', {
+                      taskId,
+                      fileName,
+                      linkText: link.linkText
+                    });
+                  }
+                }
+              } catch (readError) {
+                logEvent(state, 'MARKDOWN_LINK_FILE_EXTRACTION_FAILED', {
+                  taskId,
+                  fileName,
+                  error: String(readError.message || readError)
+                });
+              }
+            }
+          }
+        }
+        sendResponse({ ok: true, processed: links.length });
+        return;
+      }
+      
       case 'AUTOMATOR_ASSISTANT_OUTPUT':
         await handleAssistantOutput(sender.tab?.id, message.payload);
         sendResponse({ ok: true });
@@ -1361,6 +1649,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      // P0 Guard Rail: PM approves download for a task - REMOVED FOR AUTONOMY
+      // Downloads now happen automatically when files are detected in executeAgentResult
+      // This handler is kept for backward compatibility but does nothing
+      case 'AUTOMATOR_APPROVE_DOWNLOAD': {
+        sendResponse({ ok: true, message: 'PM approval logic removed - downloads are automatic' });
+        return;
+      }
+
+      // Support task status updates from UI
+      case 'AUTOMATOR_UPDATE_TASK_STATUS': {
+        const { taskId, status, note } = message;
+        
+        if (!taskId || !status) {
+          throw new Error('taskId and status are required');
+        }
+        
+        await mutateState(async (draft) => {
+          const task = draft.tasks[taskId];
+          if (!task) {
+            throw new Error(`Task not found: ${taskId}`);
+          }
+          
+          task.status = status;
+          if (note) {
+            task.note = note;
+          }
+          task.updatedAt = nowIso();
+          
+          logEvent(draft, 'TASK_STATUS_UPDATED', {
+            taskId,
+            status,
+            note: note || null
+          });
+        });
+        
+        sendResponse({ ok: true, taskId, status });
+        return;
+      }
+
       case 'AUTOMATOR_RECONCILE_NOW':
         await reconcile();
         sendResponse({ ok: true, state: await loadState() });
@@ -1471,6 +1798,141 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           maxMB: (MAX_TOTAL_STORAGE_BYTES / 1024 / 1024).toFixed(2),
           percentUsed: ((totalSize / MAX_TOTAL_STORAGE_BYTES) * 100).toFixed(1)
         });
+        return;
+      }
+
+      // P0 Guard Rail: Auto-download files from sidecar
+      case 'AUTOMATOR_DOWNLOAD_FILE': {
+        const { fileId } = message;
+        if (!fileId) {
+          throw new Error('fileId is required');
+        }
+        
+        const fileData = await getFileData(fileId);
+        if (!fileData) {
+          throw new Error(`File not found: ${fileId}`);
+        }
+        
+        try {
+          await chrome.downloads.download({
+            url: fileData.dataUrl,
+            filename: fileData.fileName,
+            saveAs: false
+          });
+          
+          logEvent(await loadState(), 'FILE_AUTO_DOWNLOADED', {
+            fileId,
+            fileName: fileData.fileName,
+            taskId: fileData.taskId
+          });
+          
+          sendResponse({ ok: true, fileId, fileName: fileData.fileName });
+        } catch (downloadError) {
+          logEvent(await loadState(), 'FILE_DOWNLOAD_FAILED', {
+            fileId,
+            error: String(downloadError.message || downloadError)
+          });
+          throw downloadError;
+        }
+        return;
+      }
+
+      // P0 Guard Rail: Auto-download multiple files for a task
+      case 'AUTOMATOR_DOWNLOAD_TASK_FILES': {
+        const { taskId } = message;
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        
+        const files = await getFilesForTask(taskId);
+        const results = [];
+        
+        for (const file of files) {
+          try {
+            await chrome.downloads.download({
+              url: file.dataUrl,
+              filename: file.fileName,
+              saveAs: false
+            });
+            results.push({ ok: true, fileId: file.fileId, fileName: file.fileName });
+          } catch (error) {
+            results.push({ ok: false, fileId: file.fileId, error: error.message });
+          }
+        }
+        
+        sendResponse({ ok: true, taskId, results });
+        return;
+      }
+
+      // P0 Guard Rail: Trigger download - REMOVED PM APPROVAL REQUIREMENT FOR AUTONOMY
+      // Downloads now happen automatically in executeAgentResult when files are detected
+      case 'AUTOMATOR_TRIGGER_DOWNLOAD': {
+        const { taskId, fileId, downloadUrl } = message;
+        
+        if (!taskId) {
+          throw new Error('taskId is required');
+        }
+        
+        // If fileId provided, download from sidecar with proper Base64-to-Blob conversion
+        if (fileId) {
+          const fileData = await getFileData(fileId);
+          if (!fileData) {
+            throw new Error(`File not found: ${fileId}`);
+          }
+          
+          try {
+            // Convert data URL to blob for chrome.downloads API
+            const response = await fetch(fileData.dataUrl);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            
+            await chrome.downloads.download({
+              url: url,
+              filename: fileData.fileName,
+              saveAs: false
+            });
+            
+            logEvent(await loadState(), 'FILE_TRIGGER_DOWNLOADED', {
+              fileId,
+              fileName: fileData.fileName,
+              taskId
+            });
+            
+            sendResponse({ ok: true, fileId, fileName: fileData.fileName, source: 'sidecar' });
+          } catch (downloadError) {
+            logEvent(await loadState(), 'FILE_TRIGGER_DOWNLOAD_FAILED', {
+              fileId,
+              error: String(downloadError.message || downloadError)
+            });
+            throw downloadError;
+          }
+        } 
+        // If downloadUrl provided, trigger direct download
+        else if (downloadUrl) {
+          try {
+            await chrome.downloads.download({
+              url: downloadUrl,
+              saveAs: false
+            });
+            
+            logEvent(await loadState(), 'URL_TRIGGER_DOWNLOADED', {
+              taskId,
+              downloadUrl
+            });
+            
+            sendResponse({ ok: true, downloadUrl, source: 'url' });
+          } catch (downloadError) {
+            logEvent(await loadState(), 'URL_TRIGGER_DOWNLOAD_FAILED', {
+              taskId,
+              downloadUrl,
+              error: String(downloadError.message || downloadError)
+            });
+            throw downloadError;
+          }
+        } else {
+          throw new Error('Either fileId or downloadUrl must be provided');
+        }
+        
         return;
       }
 
