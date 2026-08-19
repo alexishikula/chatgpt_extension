@@ -359,7 +359,7 @@ class LlmRobustParser {
   }
 }
 
-// Export for use in other modules
+// Export for use in other modules (ES6 and CommonJS)
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     LlmRobustParser,
@@ -369,6 +369,9 @@ if (typeof module !== 'undefined' && module.exports) {
     handleParseFailure
   };
 }
+
+// ES6 module export
+export { LlmRobustParser, repairJsonString, normalizeValues, extractIntentFromText, handleParseFailure };
 
 // Also expose globally for browser environments
 if (typeof window !== 'undefined') {

@@ -13,6 +13,9 @@ const AGENT_RESULT_STATUSES = new Set([
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB per file
 const MAX_TOTAL_STORAGE_BYTES = 50 * 1024 * 1024; // 50MB total
 
+// Import the LLM Robust Parser
+import { LlmRobustParser } from './src/utils/llm-robust-parser.js';
+
 let stateMutationQueue = Promise.resolve();
 
 const DEFAULT_STATE = {
@@ -291,10 +294,13 @@ function parseProtocol(text) {
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (!match) continue;
-    try {
-      const parsed = JSON.parse(match[1]);
+    
+    // Use the LLM Robust Parser to handle malformed JSON
+    const result = LlmRobustParser.parse(match[1]);
+    
+    if (result.success) {
       // Check if status needs correction even if JSON is valid
-      let corrected = normalizeStatusInCommand(parsed);
+      let corrected = normalizeStatusInCommand(result.data);
       if (corrected) {
         return {
           found: true,
@@ -305,7 +311,7 @@ function parseProtocol(text) {
         };
       }
       // Check if action needs correction
-      corrected = normalizeActionInCommand(parsed);
+      corrected = normalizeActionInCommand(result.data);
       if (corrected) {
         return {
           found: true,
@@ -315,43 +321,18 @@ function parseProtocol(text) {
           extracted: true
         };
       }
-      return { found: true, command: parsed, error: null, raw: match[1] };
-    } catch (error) {
-      // Try to fix malformed JSON and re-parse
-      const fixed = fixMalformedJsonAndExtract(match[1]);
-      if (fixed) {
-        let corrected = normalizeStatusInCommand(fixed.parsed);
-        if (corrected) {
-          return {
-            found: true,
-            command: corrected.command,
-            error: `Fixed JSON syntax and status: ${corrected.error}`,
-            raw: fixed.raw,
-            extracted: true
-          };
-        }
-        corrected = normalizeActionInCommand(fixed.parsed);
-        if (corrected) {
-          return {
-            found: true,
-            command: corrected.command,
-            error: `Fixed JSON syntax and action: ${corrected.error}`,
-            raw: fixed.raw,
-            extracted: true
-          };
-        }
-        return {
-          found: true,
-          command: fixed.parsed,
-          error: 'Fixed JSON syntax errors',
-          raw: fixed.raw,
-          extracted: true
-        };
-      }
+      return { 
+        found: true, 
+        command: result.data, 
+        error: result.warning || null, 
+        raw: match[1],
+        extracted: result.warning ? true : false
+      };
+    } else {
       return {
         found: true,
         command: null,
-        error: `Invalid JSON: ${String(error.message || error)}`,
+        error: result.error?.message || 'Parse failed',
         raw: match[1]
       };
     }
@@ -438,39 +419,16 @@ function normalizeActionInCommand(command) {
 
 /**
  * Attempt to fix common JSON structure issues and extract fields.
+ * DEPRECATED: This function is now superseded by LlmRobustParser.
+ * Kept for backward compatibility but should not be used in new code.
  */
 function fixMalformedJsonAndExtract(text) {
   if (!text || typeof text !== 'string') return null;
   
-  // Try to find and extract JSON object even without proper wrappers
-  const jsonPatterns = [
-    /\{[\s\S]*"action"[\s\S]*\}/,
-    /\{[\s\S]*"task_id"[\s\S]*\}/,
-    /\{[\s\S]*"status"[\s\S]*\}/
-  ];
-  
-  for (const pattern of jsonPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      let jsonStr = match[0];
-      
-      // Fix common JSON syntax errors
-      // Missing quotes around keys
-      jsonStr = jsonStr.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
-      
-      // Trailing commas
-      jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1');
-      
-      // Unquoted string values (basic cases)
-      jsonStr = jsonStr.replace(/:\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*([,}\n])/g, ': "$1"$2');
-      
-      try {
-        const parsed = JSON.parse(jsonStr);
-        return { parsed, raw: jsonStr };
-      } catch (_) {
-        continue;
-      }
-    }
+  // Delegate to LlmRobustParser for consistent handling
+  const result = LlmRobustParser.parse(text);
+  if (result.success && result.data) {
+    return { parsed: result.data, raw: text };
   }
   
   return null;
@@ -534,18 +492,20 @@ function extractIntentionFromText(text) {
   let deliverables = null;
   const deliverablesMatch = text.match(/deliverables["\\s:=]+\\s*(\\[.*?\\]|\\{.*?\\})/is);
   if (deliverablesMatch) {
-    try {
-      deliverables = JSON.parse(deliverablesMatch[1]);
-    } catch (_) {}
+    const deliverablesResult = LlmRobustParser.parse(deliverablesMatch[1]);
+    if (deliverablesResult.success) {
+      deliverables = deliverablesResult.data;
+    }
   }
   
   // Extract validation if present
   let validation = null;
   const validationMatch = text.match(/validation["\\s:=]+\\s*(\\{[^}]*\\})/is);
   if (validationMatch) {
-    try {
-      validation = JSON.parse(validationMatch[1]);
-    } catch (_) {}
+    const validationResult = LlmRobustParser.parse(validationMatch[1]);
+    if (validationResult.success) {
+      validation = validationResult.data;
+    }
   }
   
   // For TASK_RESULT actions, we need at least task_id and status
