@@ -32,19 +32,29 @@ function repairJsonString(rawText) {
   cleaned = cleaned.replace(/'([^']*)'/g, '"$1"');
 
   // Handle truncated JSON by adding missing closing brackets/braces
-  const openBraces = (cleaned.match(/{/g) || []).length;
-  const closeBraces = (cleaned.match(/}/g) || []).length;
-  const openBrackets = (cleaned.match(/\[/g) || []).length;
-  const closeBrackets = (cleaned.match(/]/g) || []).length;
-
-  // Add missing closing braces
-  for (let i = 0; i < openBraces - closeBraces; i++) {
-    cleaned += '}';
+  // Track the stack of open brackets/braces to close them in correct order
+  const stack = [];
+  for (const char of cleaned) {
+    if (char === '{' || char === '[') {
+      stack.push(char);
+    } else if (char === '}' || char === ']') {
+      if (stack.length > 0) {
+        const lastOpen = stack[stack.length - 1];
+        if ((lastOpen === '{' && char === '}') || (lastOpen === '[' && char === ']')) {
+          stack.pop();
+        }
+      }
+    }
   }
-
-  // Add missing closing brackets
-  for (let i = 0; i < openBrackets - closeBrackets; i++) {
-    cleaned += ']';
+  
+  // Close any remaining open brackets/braces in reverse order
+  while (stack.length > 0) {
+    const lastOpen = stack.pop();
+    if (lastOpen === '{') {
+      cleaned += '}';
+    } else if (lastOpen === '[') {
+      cleaned += ']';
+    }
   }
 
   return cleaned;
@@ -159,21 +169,29 @@ function extractIntentFromText(rawText) {
     source: 'intent_extraction'
   };
 
-  // Regex patterns for status detection
+  // Regex patterns for status detection (including partial matches)
   const statusPatterns = [
     /\b(complete|completed|done|finished)\b/i,
     /\b(in\s*progress|inprogress|processing)\b/i,
     /\b(pending|waiting|todo|to-do)\b/i,
     /\b(blocked|stuck|issue)\b/i,
-    /\b(cancelled|canceled|aborted)\b/i
+    /\b(cancelled|canceled|aborted)\b/i,
+    // Partial matches for truncated text
+    /(complete|complet|comple|compl|comp)/i,
+    /(done|don|do)/i,
+    /(finished|finish|finis|fini|fin)/i
   ];
 
-  // Regex patterns for action detection
+  // Regex patterns for action detection (including partial matches)
   const actionPatterns = [
     /\b(return|send\s*back)\b/i,
     /\b(approve|approved|accept)\b/i,
     /\b(reject|rejected|decline)\b/i,
-    /\b(forward|escalate)\b/i
+    /\b(forward|escalate)\b/i,
+    // Partial matches for truncated text
+    /(return|retur|retu|ret|re)/i,
+    /(send\s*back|send\s*bac|send\s*ba|send\s*b)/i,
+    /(approve|approv|appro|appr|app)/i
   ];
 
   // File link detection (URLs, file paths)
@@ -208,11 +226,11 @@ function extractIntentFromText(rawText) {
     const match = rawText.match(pattern);
     if (match) {
       const matchedText = match[0].toLowerCase().trim();
-      if (/return|send\s*back/.test(matchedText)) {
+      if (/return|retur|retu|ret|re|send\s*back/.test(matchedText)) {
         intent.action = 'RETURN_TO_PM';
-      } else if (/approve|accept/.test(matchedText)) {
+      } else if (/approve|approv|appro|appr|app|accept/.test(matchedText)) {
         intent.action = 'APPROVE';
-      } else if (/reject|decline/.test(matchedText)) {
+      } else if (/reject|rejected|decline/.test(matchedText)) {
         intent.action = 'REJECT';
       } else if (/forward|escalate/.test(matchedText)) {
         intent.action = 'ESCALATE';
@@ -254,16 +272,14 @@ function handleParseFailure(error, rawText, stage) {
       timestamp: new Date().toISOString()
     },
     rawText: rawText,
-    fallback: null
+    intent: null
   };
 
   // Attempt intent extraction as final fallback
   try {
     const intent = extractIntentFromText(rawText);
-    if (intent) {
-      errorPayload.fallback = intent;
-      errorPayload.success = true;
-      errorPayload.warning = 'Parsed via intent extraction after JSON failure';
+    if (intent && Object.keys(intent).length > 0) {
+      errorPayload.intent = intent;
     }
   } catch (extractionError) {
     // Silently fail - we're already in error handling
@@ -386,14 +402,17 @@ class LlmRobustParser {
   }
 
   /**
-   * Validate if text contains valid JSON structure
+   * Validate if text contains valid JSON structure (without repairs)
    * @param {string} rawText - The raw text to validate
-   * @returns {boolean} - True if valid JSON can be extracted
+   * @returns {boolean} - True if valid JSON without any repairs needed
    */
   static isValidJson(rawText) {
+    if (!rawText || typeof rawText !== 'string') {
+      return false;
+    }
     try {
-      const repaired = repairJsonString(rawText);
-      JSON.parse(repaired);
+      // Test the raw text directly without any repairs
+      JSON.parse(rawText);
       return true;
     } catch {
       return false;

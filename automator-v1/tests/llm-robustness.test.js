@@ -53,7 +53,7 @@ describe('LlmRobustParser - Layer 1: Syntax Repair', () => {
       // Note: The repair adds both ] and } to close the array and object
       assert.ok(result.includes('"file1.txt"'));
       assert.ok(result.includes('"file2.txt"'));
-      assert.ok(result.endsWith('}]'));
+      assert.ok(result.endsWith(']}'));
     });
 
     it('should handle multiple syntax issues at once', () => {
@@ -249,7 +249,7 @@ describe('LlmRobustParser - Layer 4: Graceful Degradation', () => {
       assert.strictEqual(result.success, false);
       assert.strictEqual(result.error.message, 'Invalid JSON');
       assert.strictEqual(result.rawText, rawText);
-      assert.ok(result.timestamp);
+      assert.ok(result.error.timestamp);
     });
 
     it('should include intent extraction as fallback', () => {
@@ -368,7 +368,7 @@ describe('LlmRobustParser - Full Parse Pipeline', () => {
       
       assert.throws(() => {
         LlmRobustParser.parseStrict(input);
-      }, /Failed to parse/);
+      }, /Parse failed:/);
     });
 
     it('should succeed on valid JSON in strict mode', () => {
