@@ -698,18 +698,27 @@ async function dispatchMessageToAgent(state, agentId, text, taskId = null) {
   
   // If there are files in the sidecar for this task, include file metadata in the message
   let enrichedText = text;
+  let filesToSend = [];
   if (taskId) {
     const files = await getFilesForTask(taskId);
     if (files && files.length > 0) {
       const fileList = files.map(f => `- ${f.fileName} (${f.fileType}, ${(f.sizeBytes / 1024).toFixed(1)}KB)`).join('\n');
       enrichedText = text + '\n\n---\nATTACHED DELIVERABLES FROM PREVIOUS AGENT:\n' + fileList + 
                      '\n\nUse sidecar.getFileData(fileId) to retrieve each file.';
+      
+      // Prepare files for attachment by converting data URLs to sendable format
+      filesToSend = files.map(f => ({
+        dataUrl: f.dataUrl || '', // Will be populated from getFileData
+        fileName: f.fileName
+      }));
     }
   }
   
+  // Use the new message type that supports file attachments
   const response = await sendToTab(tab.id, {
-    type: 'AUTOMATOR_SEND_MESSAGE',
+    type: 'AUTOMATOR_SEND_MESSAGE_WITH_FILES',
     text: enrichedText,
+    files: filesToSend,
     taskId
   });
   logEvent(state, 'DISPATCH_MESSAGE_TO_AGENT', { 

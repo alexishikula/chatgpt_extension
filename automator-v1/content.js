@@ -127,6 +127,126 @@
     }));
   }
 
+  /**
+   * Send a message with file attachments
+   * @param {string} text - Message text to send
+   * @param {Array<{dataUrl: string, fileName: string}>} files - Array of file objects with dataUrl and fileName
+   * @returns {Promise<void>}
+   */
+  async function sendMessageWithFiles(text, files = []) {
+    const composer = findComposer();
+    if (!composer) throw new Error('ChatGPT message composer was not found.');
+    if (isStreaming()) throw new Error('ChatGPT is currently generating a response.');
+
+    // Set the message text
+    setComposerText(composer, text);
+    await new Promise((resolve) => setTimeout(resolve, 180));
+
+    // Attach files if provided
+    if (files && files.length > 0) {
+      // Find the file input or attachment area
+      const fileInputSelector = 'input[type="file"]';
+      let fileInput = document.querySelector(fileInputSelector);
+      
+      if (!fileInput) {
+        // Try to find attachment button first
+        const attachSelectors = [
+          'button[aria-label*="Attach"]',
+          'button[aria-label*="Upload"]',
+          'button[data-testid*="attach"]',
+          'button svg path[d*="paperclip"]'
+        ];
+        
+        for (const selector of attachSelectors) {
+          const attachButton = document.querySelector(selector);
+          if (attachButton) {
+            attachButton.click();
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            fileInput = document.querySelector(fileInputSelector);
+            if (fileInput) break;
+          }
+        }
+      }
+
+      if (fileInput) {
+        // Convert data URLs to File objects and attach them
+        const fileList = [];
+        for (const fileData of files) {
+          try {
+            const file = await dataUrlToFile(fileData.dataUrl, fileData.fileName);
+            fileList.push(file);
+          } catch (error) {
+            console.error('Failed to convert file:', fileData.fileName, error);
+          }
+        }
+
+        if (fileList.length > 0) {
+          // Create a DataTransfer object to set files on the input
+          const dataTransfer = new DataTransfer();
+          for (const file of fileList) {
+            dataTransfer.items.add(file);
+          }
+          
+          // Set the files on the input element
+          fileInput.files = dataTransfer.files;
+          fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+          
+          // Wait for files to be processed
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      }
+    }
+
+    // Wait for send button to be enabled (polling mechanism)
+    const sendSelectors = [
+      'button[data-testid="send-button"]',
+      'button[aria-label="Send prompt"]',
+      'button[aria-label*="Send"]'
+    ];
+    
+    let sendButton = null;
+    const maxWaitTime = 5000; // 5 seconds max wait
+    const pollInterval = 200; // Check every 200ms
+    let waitedTime = 0;
+
+    while (waitedTime < maxWaitTime) {
+      for (const selector of sendSelectors) {
+        const candidate = document.querySelector(selector);
+        if (candidate && !candidate.disabled) {
+          sendButton = candidate;
+          break;
+        }
+      }
+      
+      if (sendButton) break;
+      
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      waitedTime += pollInterval;
+    }
+
+    if (sendButton) {
+      sendButton.click();
+      return;
+    }
+
+    // Fallback: trigger Enter key
+    composer.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true
+    }));
+  }
+
+  // Helper function to convert Data URL to File
+  async function dataUrlToFile(dataUrl, fileName) {
+    const response = await fetch(dataUrl);
+    const blob = await response.blob();
+    return new File([blob], fileName, { type: blob.type });
+  }
+
   async function announceLatest() {
     const message = getLastAssistantMessage();
     if (!message || message.streaming || message.fingerprint === lastAnnouncedFingerprint) return;
@@ -213,6 +333,12 @@
       }
       if (message?.type === 'AUTOMATOR_SEND_MESSAGE') {
         await sendMessage(String(message.text || ''));
+        sendResponse({ ok: true });
+        return;
+      }
+      if (message?.type === 'AUTOMATOR_SEND_MESSAGE_WITH_FILES') {
+        const { text, files } = message;
+        await sendMessageWithFiles(String(text || ''), files || []);
         sendResponse({ ok: true });
         return;
       }
