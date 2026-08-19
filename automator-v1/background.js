@@ -1115,6 +1115,9 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
                 fileName: fileData.fileName,
                 taskId: task.id
               });
+              
+              // Clean up object URL after download starts to prevent memory leaks
+              setTimeout(() => URL.revokeObjectURL(url), 5000);
             } catch (downloadError) {
               logEvent(state, 'FILE_AUTO_DOWNLOAD_FAILED', {
                 fileId: file.fileId,
@@ -1157,7 +1160,7 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
       try {
         const targetTab = await resolveTabForAgent(state, normalizeAgentId(task.returnToAgentId));
         
-        // Inject each file into the chat composer
+        // Inject each file into the chat composer with retry logic
         for (const file of files) {
           const fileData = await getFileData(file.fileId);
           if (fileData && fileData.dataUrl) {
@@ -1165,25 +1168,46 @@ async function executeAgentResult(state, sourceAgentId, command, rawText) {
             const base64Data = fileData.dataUrl.split(',')[1];
             const fileType = fileData.dataUrl.split(';')[0].replace('data:', '');
             
-            await chrome.tabs.sendMessage(targetTab.id, {
-              type: 'AUTOMATOR_INJECT_FILE',
-              fileBlobBase64: base64Data,
-              fileName: fileData.fileName,
-              fileType: fileType
-            });
+            // Retry injection up to 3 times with delays
+            let injected = false;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                const result = await chrome.tabs.sendMessage(targetTab.id, {
+                  type: 'AUTOMATOR_INJECT_FILE',
+                  fileBlobBase64: base64Data,
+                  fileName: fileData.fileName,
+                  fileType: fileType
+                });
+                
+                if (result && result.ok) {
+                  injected = true;
+                  logEvent(state, 'FILE_INJECTED_TO_NEXT_AGENT', {
+                    fileId: file.fileId,
+                    fileName: fileData.fileName,
+                    taskId: task.id,
+                    targetAgentId: task.returnToAgentId,
+                    targetTabId: targetTab.id,
+                    attempt
+                  });
+                  break;
+                }
+              } catch (injectError) {
+                if (attempt < 3) {
+                  await new Promise(resolve => setTimeout(resolve, 500));
+                  continue;
+                }
+                throw injectError;
+              }
+            }
             
-            logEvent(state, 'FILE_INJECTED_TO_NEXT_AGENT', {
-              fileId: file.fileId,
-              fileName: fileData.fileName,
-              taskId: task.id,
-              targetAgentId: task.returnToAgentId,
-              targetTabId: targetTab.id
-            });
+            if (!injected) {
+              throw new Error('Failed to inject file after 3 attempts');
+            }
           }
         }
         
-        // Small delay to allow UI to process injected files
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Delay to allow UI to process injected files and auto-send
+        await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (injectError) {
         logEvent(state, 'FILE_INJECTION_FAILED', {
           error: String(injectError.message || injectError),
@@ -1431,6 +1455,77 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     switch (message?.type) {
+      // P0 Guard Rail: Auto-process markdown links detected by content script
+      case 'AUTOMATOR_MARKDOWN_LINKS_DETECTED': {
+        const { links, text } = message;
+        const tabId = sender.tab?.id;
+        if (!tabId || !links || links.length === 0) {
+          sendResponse({ ok: false, error: 'No links or tab info' });
+          return;
+        }
+        
+        const state = await loadState();
+        const sourceAgentId = agentIdForTab(state, tabId);
+        if (!sourceAgentId) {
+          sendResponse({ ok: false, error: 'Agent not found for tab' });
+          return;
+        }
+        
+        const sourceAgent = state.agents[sourceAgentId];
+        logEvent(state, 'MARKDOWN_LINKS_AUTO_DETECTED', {
+          sourceAgentId,
+          linkCount: links.length,
+          links
+        });
+        
+        // Auto-request sidecar storage for sandbox: links
+        for (const link of links) {
+          if (link.url && link.url.startsWith('sandbox:')) {
+            const taskId = getActiveTaskForAgent(state, sourceAgentId)?.id;
+            if (taskId) {
+              const fileName = link.fullPath.split('/').pop() || 'unknown_file';
+              try {
+                if (sourceAgent.tabId) {
+                  const readResult = await sendToTab(sourceAgent.tabId, {
+                    type: 'AUTOMATOR_READ_FILE',
+                    filePath: link.fullPath,
+                    fileName,
+                    taskId,
+                    sha256: null
+                  });
+                  
+                  if (readResult && readResult.ok && readResult.dataUrl) {
+                    await storeFileForTask(
+                      taskId,
+                      fileName,
+                      getFileTypeFromName(fileName),
+                      readResult.dataUrl,
+                      {
+                        uploadedByAgentId: sourceAgentId,
+                        description: `Auto-extracted from markdown link: ${link.linkText}`
+                      }
+                    );
+                    logEvent(state, 'FILE_AUTO_EXTRACTED_FROM_MARKDOWN_LINK', {
+                      taskId,
+                      fileName,
+                      linkText: link.linkText
+                    });
+                  }
+                }
+              } catch (readError) {
+                logEvent(state, 'MARKDOWN_LINK_FILE_EXTRACTION_FAILED', {
+                  taskId,
+                  fileName,
+                  error: String(readError.message || readError)
+                });
+              }
+            }
+          }
+        }
+        sendResponse({ ok: true, processed: links.length });
+        return;
+      }
+      
       case 'AUTOMATOR_ASSISTANT_OUTPUT':
         await handleAssistantOutput(sender.tab?.id, message.payload);
         sendResponse({ ok: true });

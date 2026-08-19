@@ -213,7 +213,26 @@
 
   const observer = new MutationObserver(() => {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(announceLatest, 900);
+    debounceTimer = setTimeout(async () => {
+      announceLatest();
+      // Auto-trigger markdown link extraction when new messages appear
+      const lastMsg = getLastAssistantMessage();
+      if (lastMsg && lastMsg.text) {
+        const links = extractMarkdownLinks(lastMsg.text);
+        if (links.length > 0) {
+          // Notify background script immediately about detected sandbox links
+          try {
+            await chrome.runtime.sendMessage({ 
+              type: 'AUTOMATOR_MARKDOWN_LINKS_DETECTED', 
+              links,
+              text: lastMsg.text 
+            });
+          } catch (_) {
+            // Background may be restarting; will reconcile later
+          }
+        }
+      }
+    }, 900);
   });
 
   observer.observe(document.documentElement, {
@@ -236,7 +255,8 @@
   function extractMarkdownLinks(text) {
     if (!text || typeof text !== 'string') return [];
     
-    const markdownLinkPattern = /\\[([^\\]]+)\\]\\((sandbox:[^)]+)\\)/gi;
+    // Fixed regex: properly matches [text](sandbox://path) format
+    const markdownLinkPattern = /\[([^\]]+)\]\((sandbox:[^)]+)\)/gi;
     const links = [];
     let match;
     
