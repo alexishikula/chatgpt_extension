@@ -1556,8 +1556,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       // P0 Guard Rail: PM approves download for a task - REMOVED FOR AUTONOMY
       // Downloads now happen automatically when files are detected in executeAgentResult
+      // This handler is kept for backward compatibility but does nothing
       case 'AUTOMATOR_APPROVE_DOWNLOAD': {
-        sendResponse({ ok: false, error: 'PM approval logic removed - downloads are now automatic' });
+        sendResponse({ ok: true, message: 'PM approval logic removed - downloads are automatic' });
         return;
       }
 

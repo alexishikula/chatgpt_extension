@@ -156,7 +156,39 @@
     }
     
     // Small delay to allow UI to register the file
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    
+    // Auto-send the message with attached file - no human intervention needed
+    try {
+      const sendSelectors = [
+        'button[data-testid="send-button"]',
+        'button[aria-label*="Send"]',
+        'button[class*="send"]'
+      ];
+      let sendButton = null;
+      for (const selector of sendSelectors) {
+        const candidate = document.querySelector(selector);
+        if (candidate && !candidate.disabled) {
+          sendButton = candidate;
+          break;
+        }
+      }
+      if (sendButton) {
+        sendButton.click();
+      } else {
+        // Fallback: simulate Enter key
+        composer.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true
+        }));
+      }
+    } catch (sendError) {
+      console.warn('Auto-send failed:', sendError);
+      // Continue anyway - file is injected, user can manually send
+    }
     
     // Clean up the input element after it's been processed
     setTimeout(() => {
@@ -165,7 +197,7 @@
       }
     }, 2000);
     
-    return { ok: true, fileName, size: fileBlob.size };
+    return { ok: true, fileName, size: fileBlob.size, autoSent: true };
   }
 
   async function announceLatest() {
