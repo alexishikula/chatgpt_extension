@@ -83,50 +83,50 @@ function renderAgents() {
       ${agent.description ? `<div class="description">${esc(agent.description)}</div>` : ''}
       <div class="muted tab-line">${esc(agent.title || 'ChatGPT')}<br>${esc(shortConversation(agent.conversationUrl))}</div>
       <div class="card-actions">
-        <button data-open-agent="${esc(agent.id)}">Open</button>
-        <button data-edit-agent="${esc(agent.id)}">Edit</button>
-        <button data-remove-agent="${esc(agent.id)}">Remove</button>
+        <button data-open-agent="${esc(agent.id)}" class="btn btn-secondary btn-sm">Open</button>
+        <button data-edit-agent="${esc(agent.id)}" class="btn btn-ghost btn-sm">Edit</button>
+        <button data-remove-agent="${esc(agent.id)}" class="btn btn-danger btn-sm">Remove</button>
       </div>
     </div>
-  `).join('') : '<div class="empty">No agents created yet.</div>';
+  `).join('') : '<div class="empty-message"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21V19C17 16.7909 15.2091 15 13 15H5C2.79086 15 1 16.7909 1 19V21"/><path d="M9 11C11.2091 11 13 9.20914 13 7C13 4.79086 11.2091 3 9 3C6.79086 3 5 4.79086 5 7C5 9.20914 6.79086 11 9 11Z"/><path d="M23 21V19C22.9993 18.1771 22.7988 17.3656 22.416 16.6347C22.0332 15.9038 21.4801 15.2756 20.8 14.8"/><path d="M16 3.13C16.8604 3.00508 17.7389 3.09901 18.5472 3.40245C19.3555 3.70589 20.0649 4.20845 20.6039 4.85947C21.1428 5.51049 21.4925 6.28713 21.6161 7.1096C21.7397 7.93207 21.6326 8.77079 21.306 9.53352"/></svg><p>No agents created yet</p></div>';
 }
 
 function renderGates() {
   const gates = Object.values(state?.ownerGates || {}).filter((gate) => gate.status === 'WAITING_FOR_OWNER');
-  $('gates').className = gates.length ? '' : 'empty';
+  $('gates').className = gates.length ? '' : 'empty-state';
   $('gates').innerHTML = gates.length ? gates.map((gate) => `
     <div class="card gate">
       <div class="card-row">
         <div class="role">${esc(gate.id)}</div>
-        <span class="badge warn">WAITING FOR OWNER</span>
+        <span class="badge warn">Waiting for Owner</span>
       </div>
       <div><strong>${esc(gate.reason || 'Owner decision required')}</strong></div>
       <div class="muted">${esc(gate.instructions || '')}</div>
       ${gate.taskId ? `<div class="agent-id">Task: ${esc(gate.taskId)}</div>` : ''}
       <div class="card-actions">
-        <button data-gate="${esc(gate.id)}" data-resolution="PASS">Approve / Pass</button>
-        <button data-gate="${esc(gate.id)}" data-resolution="FAIL">Reject / Fail</button>
+        <button data-gate="${esc(gate.id)}" data-resolution="PASS" class="btn btn-primary btn-sm">Approve / Pass</button>
+        <button data-gate="${esc(gate.id)}" data-resolution="FAIL" class="btn btn-danger btn-sm">Reject / Fail</button>
       </div>
     </div>
-  `).join('') : 'No active gates.';
+  `).join('') : '<div class="empty-message"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z"/><path d="M12 18V12"/><path d="M12 8H12.01"/></svg><p>No active gates requiring your attention</p></div>';
 }
 
 function renderTasks() {
   const tasks = Object.values(state?.tasks || {}).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-  $('tasks').className = tasks.length ? '' : 'empty';
+  $('tasks').className = tasks.length ? '' : 'empty-state';
   $('tasks').innerHTML = tasks.length ? tasks.slice(0, 25).map((task) => {
     const target = state.agents?.[task.assignedToAgentId];
     return `
       <div class="card">
         <div class="card-row">
           <span class="task-id">${esc(task.id)}</span>
-          <span class="badge">${esc(task.status)}</span>
+          <span class="badge info">${esc(task.status)}</span>
         </div>
         <div class="muted">${esc(target?.name || task.assignedToAgentId || 'Unknown agent')}</div>
         ${task.agentStatus ? `<div class="agent-id">Agent result: ${esc(task.agentStatus)}</div>` : ''}
       </div>
     `;
-  }).join('') : 'No tasks yet.';
+  }).join('') : '<div class="empty-message"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 11L12 14L22 4"/><path d="M21 12V19C21 19.5304 20.7893 20.0391 20.4142 20.4142C20.0391 20.7893 19.5304 21 19 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V5C3 4.46957 3.21071 3.96086 3.58579 3.58579C3.96086 3.21071 4.46957 3 5 3H16"/></svg><p>No tasks yet</p></div>';
 }
 
 function renderEvents() {

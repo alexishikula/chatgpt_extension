@@ -5,81 +5,154 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Automator V1</title>
   <link rel="stylesheet" href="sidepanel.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-  <header>
-    <div>
-      <h1>Automator</h1>
-      <div class="sub">V1 · tab-based prototype</div>
+  <header class="app-header">
+    <div class="header-brand">
+      <div class="logo">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="24" height="24" rx="6" fill="url(#gradient)"/>
+          <path d="M7 12L10.5 15.5L17 8.5" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <defs>
+            <linearGradient id="gradient" x1="0" y1="0" x2="24" y2="24">
+              <stop stop-color="#6366F1"/>
+              <stop offset="1" stop-color="#8B5CF6"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+      <div class="header-title">
+        <h1>Automator</h1>
+        <span class="version-badge">V1</span>
+      </div>
     </div>
-    <button id="pauseButton" class="danger">Pause</button>
+    <div class="header-actions">
+      <button id="pauseButton" class="btn btn-danger" title="Pause/Resume automation">
+        <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M10 15V9M14 15V9"/>
+        </svg>
+        <span>Pause</span>
+      </button>
+    </div>
   </header>
-
+  
   <section class="status-strip">
-    <span>System</span>
-    <strong id="systemStatus">Loading…</strong>
+    <div class="status-info">
+      <svg class="status-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z"/>
+        <path d="M12 6V12L16 14"/>
+      </svg>
+      <span>System Status</span>
+    </div>
+    <strong id="systemStatus" class="status-value">Loading…</strong>
   </section>
-
-  <section>
+  
+  <section class="main-section">
     <div class="section-head">
-      <h2>Agents</h2>
-      <button id="refreshButton" class="secondary">Reconcile</button>
+      <h2><svg class="section-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21V19C17 16.7909 15.2091 15 13 15H5C2.79086 15 1 16.7909 1 19V21"/><path d="M9 11C11.2091 11 13 9.20914 13 7C13 4.79086 11.2091 3 9 3C6.79086 3 5 4.79086 5 7C5 9.20914 6.79086 11 9 11Z"/><path d="M23 21V19C22.9993 18.1771 22.7988 17.3656 22.416 16.6347C22.0332 15.9038 21.4801 15.2756 20.8 14.8"/><path d="M16 3.13C16.8604 3.00508 17.7389 3.09901 18.5472 3.40245C19.3555 3.70589 20.0649 4.20845 20.6039 4.85947C21.1428 5.51049 21.4925 6.28713 21.6161 7.1096C21.7397 7.93207 21.6326 8.77079 21.306 9.53352"/></svg> Agents</h2>
+      <button id="refreshButton" class="btn btn-secondary btn-sm">
+        <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4V10H17"/><path d="M1 20V14H7"/><path d="M3.51 9.00001C4.01717 7.56678 4.97491 6.3344 6.26209 5.45882C7.54927 4.58324 9.10772 4.1015 10.71 4.08201C12.3123 4.06251 13.8812 4.50617 15.2069 5.35378C16.5326 6.20139 17.5512 7.41331 18.14 8.84001L23 10M1 14C1.51297 15.4606 2.50763 16.7138 3.83896 17.5771C5.17029 18.4405 6.76821 18.8685 8.39001 18.795C10.0118 18.7215 11.5696 18.1905 12.85 17.274C14.1304 16.3575 15.0719 15.0998 15.56 13.65L1 14Z"/></svg>
+        Reconcile
+      </button>
     </div>
     <p class="hint">Create an agent, describe it, and assign one open ChatGPT conversation to it. Automator remembers the conversation even if Chrome later gives the tab a different ID.</p>
 
     <div class="agent-form">
-      <label>
-        Type
-        <select id="agentType">
-          <option value="SPECIALIST">Specialist agent</option>
-          <option value="PM">Project Manager</option>
-        </select>
+      <div class="form-grid">
+        <label class="form-field">
+          <span class="field-label">Type</span>
+          <select id="agentType">
+            <option value="SPECIALIST">Specialist Agent</option>
+            <option value="PM">Project Manager</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span class="field-label">Agent ID</span>
+          <input id="agentId" placeholder="firmware_engineer" autocomplete="off" />
+        </label>
+      </div>
+      <label class="form-field">
+        <span class="field-label">Name</span>
+        <input id="agentName" placeholder="e.g., Firmware Engineer" autocomplete="off" />
       </label>
-      <label>
-        Name
-        <input id="agentName" placeholder="Firmware Engineer" autocomplete="off" />
+      <label class="form-field">
+        <span class="field-label">Description</span>
+        <textarea id="agentDescription" rows="2" placeholder="Describe what this agent handles..."></textarea>
       </label>
-      <label>
-        Agent ID
-        <input id="agentId" placeholder="firmware_engineer" autocomplete="off" />
-      </label>
-      <label>
-        Description
-        <textarea id="agentDescription" rows="2" placeholder="Handles major firmware implementation."></textarea>
-      </label>
-      <label>
-        ChatGPT conversation
-        <select id="tabSelect"></select>
+      <label class="form-field">
+        <span class="field-label">ChatGPT Conversation</span>
+        <div class="select-wrapper">
+          <select id="tabSelect"></select>
+        </div>
       </label>
       <div class="form-actions">
-        <button id="saveAgentButton">Create agent</button>
-        <button id="cancelEditButton" class="secondary hidden">Cancel edit</button>
-        <button id="refreshTabsButton" class="secondary">Refresh tabs</button>
+        <button id="saveAgentButton" class="btn btn-primary">
+          <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5V19"/><path d="M5 12H19"/></svg>
+          Create Agent
+        </button>
+        <button id="cancelEditButton" class="btn btn-secondary hidden">Cancel</button>
+        <button id="refreshTabsButton" class="btn btn-ghost btn-sm">
+          <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4V10H17"/><path d="M1 20V14H7"/><path d="M3.51 9.00001C4.01717 7.56678 4.97491 6.3344 6.26209 5.45882C7.54927 4.58324 9.10772 4.1015 10.71 4.08201C12.3123 4.06251 13.8812 4.50617 15.2069 5.35378C16.5326 6.20139 17.5512 7.41331 18.14 8.84001L23 10M1 14C1.51297 15.4606 2.50763 16.7138 3.83896 17.5771C5.17029 18.4405 6.76821 18.8685 8.39001 18.795C10.0118 18.7215 11.5696 18.1905 12.85 17.274C14.1304 16.3575 15.0719 15.0998 15.56 13.65L1 14Z"/></svg>
+          Refresh Tabs
+        </button>
       </div>
     </div>
 
-    <div id="agents"></div>
+    <div id="agents" class="card-list"></div>
   </section>
-
-  <section>
-    <h2>Owner gates</h2>
-    <div id="gates" class="empty">No active gates.</div>
+  
+  <section class="main-section">
+    <div class="section-head">
+      <h2><svg class="section-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z"/><path d="M12 18V12"/><path d="M12 8H12.01"/></svg> Owner Gates</h2>
+    </div>
+    <div id="gates" class="card-list empty-state">
+      <div class="empty-message">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z"/>
+          <path d="M12 18V12"/><path d="M12 8H12.01"/>
+        </svg>
+        <p>No active gates requiring your attention</p>
+      </div>
+    </div>
   </section>
-
-  <section>
-    <h2>Tasks</h2>
-    <div id="tasks" class="empty">No tasks yet.</div>
+  
+  <section class="main-section">
+    <div class="section-head">
+      <h2><svg class="section-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11L12 14L22 4"/><path d="M21 12V19C21 19.5304 20.7893 20.0391 20.4142 20.4142C20.0391 20.7893 19.5304 21 19 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V5C3 4.46957 3.21071 3.96086 3.58579 3.58579C3.96086 3.21071 4.46957 3 5 3H16"/></svg> Tasks</h2>
+    </div>
+    <div id="tasks" class="card-list empty-state">
+      <div class="empty-message">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M9 11L12 14L22 4"/><path d="M21 12V19C21 19.5304 20.7893 20.0391 20.4142 20.4142C20.0391 20.7893 19.5304 21 19 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V5C3 4.46957 3.21071 3.96086 3.58579 3.58579C3.96086 3.21071 4.46957 3 5 3H16"/>
+        </svg>
+        <p>No tasks yet</p>
+      </div>
+    </div>
   </section>
-
-  <section>
-    <h2>Recent activity</h2>
+  
+  <section class="main-section">
+    <div class="section-head">
+      <h2><svg class="section-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8V12L15 15"/><path d="M22 12C22 17.5228 17.5228 22 12 22C6.47715 22 2 17.5228 2 12C2 6.47715 6.47715 2 12 2C17.5228 2 22 6.47715 22 12Z"/></svg> Recent Activity</h2>
+    </div>
     <div id="events" class="event-list"></div>
   </section>
-
-  <details>
-    <summary>JSON protocol examples</summary>
-    <p class="hint">PM routes downward by specifying <code>target_agent_id</code>.</p>
-    <pre>&lt;&lt;AUTOMATOR&gt;&gt;
+  
+  <details class="protocol-examples">
+    <summary>
+      <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+      JSON Protocol Examples
+    </summary>
+    <div class="examples-content">
+      <div class="example-card">
+        <div class="example-header">
+          <span class="example-type">PM → Agent Dispatch</span>
+          <span class="badge badge-info">Downward Routing</span>
+        </div>
+        <pre>&lt;&lt;AUTOMATOR&gt;&gt;
 {
   "action": "DISPATCH_TASK",
   "task_id": "TEST-001",
@@ -87,8 +160,13 @@
   "assignment": "Review the work and report your result."
 }
 &lt;&lt;END_AUTOMATOR&gt;&gt;</pre>
-    <p class="hint">Agents never specify a destination. Automator returns the result to the PM stored on the task.</p>
-    <pre>&lt;&lt;AUTOMATOR&gt;&gt;
+      </div>
+      <div class="example-card">
+        <div class="example-header">
+          <span class="example-type">Agent → PM Result</span>
+          <span class="badge badge-success">Return to PM</span>
+        </div>
+        <pre>&lt;&lt;AUTOMATOR&gt;&gt;
 {
   "action": "TASK_RESULT",
   "task_id": "TEST-001",
@@ -96,13 +174,18 @@
   "summary": "Review completed."
 }
 &lt;&lt;END_AUTOMATOR&gt;&gt;</pre>
+      </div>
+    </div>
   </details>
-
-  <footer>
-    <button id="clearButton" class="text-button">Reset local Automator data</button>
-    <div id="message" aria-live="polite"></div>
+  
+  <footer class="app-footer">
+    <button id="clearButton" class="btn btn-text">
+      <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6H5H21"/><path d="M8 6V4C8 3.46957 8.21071 2.96086 8.58579 2.58579C8.96086 2.21071 9.46957 2 10 2H14C14.5304 2 15.0391 2.21071 15.4142 2.58579C15.7893 2.96086 16 3.46957 16 4V6M19 6V20C19 20.5304 18.7893 21.0391 18.4142 21.4142C18.0391 21.7893 17.5304 22 17 22H7C6.46957 22 5.96086 21.7893 5.58579 21.4142C5.21071 21.0391 5 20.5304 5 20V6H19Z"/></svg>
+      Reset Local Data
+    </button>
+    <div id="message" class="toast" aria-live="polite"></div>
   </footer>
-
+  
   <script src="sidepanel.js"></script>
 </body>
 </html>
