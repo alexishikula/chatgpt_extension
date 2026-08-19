@@ -17,6 +17,8 @@ const MAX_TOTAL_STORAGE_BYTES = 50 * 1024 * 1024; // 50MB total
 import { LlmRobustParser } from './src/utils/llm-robust-parser.js';
 // Import the Smart Request Retrier for network resilience
 import { retryRequest } from './src/utils/request-retrier.js';
+// Import the Storage Manager for compression and automatic cleanup
+import { setItem, getItem, removeItem, getStats, autoCleanup, MAX_ITEM_SIZE_BYTES, MAX_TOTAL_SIZE_BYTES, DEFAULT_TTL_HOURS } from './src/utils/storage-manager.js';
 
 let stateMutationQueue = Promise.resolve();
 
@@ -103,23 +105,25 @@ function normalizeState(raw) {
 }
 
 async function loadState() {
-  const stored = await chrome.storage.local.get(STORAGE_KEY);
-  return normalizeState(stored[STORAGE_KEY]);
+  const stored = await getItem(STORAGE_KEY);
+  return normalizeState(stored);
 }
 
 async function saveState(state) {
   state.version = 2;
-  await chrome.storage.local.set({ [STORAGE_KEY]: state });
+  // State is critical, use longer TTL (7 days) and force compression for large states
+  await setItem(STORAGE_KEY, state, { ttlHours: 168, forceCompress: true });
 }
 
 // File Sidecar Functions for storing deliverables between agents
 async function loadFileSidecar() {
-  const stored = await chrome.storage.local.get(FILE_SIDECAR_KEY);
-  return stored[FILE_SIDECAR_KEY] || {};
+  const stored = await getItem(FILE_SIDECAR_KEY);
+  return stored || {};
 }
 
 async function saveFileSidecar(sidecar) {
-  await chrome.storage.local.set({ [FILE_SIDECAR_KEY]: sidecar });
+  // File sidecar uses default 24h TTL with auto-compression
+  await setItem(FILE_SIDECAR_KEY, sidecar, { ttlHours: DEFAULT_TTL_HOURS, forceCompress: true });
 }
 
 async function getTotalStorageSize() {
@@ -1181,8 +1185,8 @@ async function ensureReconcileAlarm() {
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
-  const current = await chrome.storage.local.get(STORAGE_KEY);
-  await saveState(normalizeState(current[STORAGE_KEY]));
+  const current = await getItem(STORAGE_KEY);
+  await saveState(normalizeState(current));
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
   await ensureReconcileAlarm();
 });
