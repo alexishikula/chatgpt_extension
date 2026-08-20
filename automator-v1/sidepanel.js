@@ -346,6 +346,9 @@ function toggleCreateAgentForm() {
   }
 }
 
+// Expose to global scope for HTML onclick handlers
+window.toggleCreateAgentForm = toggleCreateAgentForm;
+
 $('clearButton').addEventListener('click', async () => {
   if (!confirm('Reset all local Automator agents, tasks, gates, and logs?')) return;
   try {
