@@ -144,6 +144,19 @@ async function storeFileForTask(taskId, fileName, fileType, dataUrl, metadata = 
     }
     
     const fileId = `${taskId}:${fileName}`;
+    
+    // Delete any existing file with the same taskId and fileName before storing new one
+    // This ensures files are replaced rather than accumulated for the same task
+    if (sidecar[fileId]) {
+      delete sidecar[fileId];
+      logEvent(state, 'FILE_REPLACED_IN_SIDECAR', {
+        fileId,
+        taskId,
+        fileName,
+        reason: 'Replacing with new version'
+      });
+    }
+    
     sidecar[fileId] = {
       taskId,
       fileName,
